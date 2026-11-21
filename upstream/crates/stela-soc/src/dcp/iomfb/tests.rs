@@ -1678,7 +1678,10 @@ fn pacing_reports_rate_gaps_stalls_lateness_and_queue_depth() {
     assert!(
         line.contains(&format!(" gaps=1:{}/2:0/3:1/4-7:0/8+:0 ", pacing.gaps - 1))
             && line.contains(" burst_fps=")
-            && line.ends_with(" overlapped=1/1"),
+            && line.contains(" overlapped=1/1 ")
+            && line.ends_with(
+                " composed=gpu:0/cpu:0 gpu_frames=flipped:0/replaced:0 gpu_ms=0.00/0.00 gpu_copied_layers=0"
+            ),
         "{line}"
     );
     // A window in which nothing was submitted or shown is not reported.
@@ -2156,6 +2159,7 @@ fn a_present_that_moves_a_layer_whole_counts_as_moved() {
                 height: 32,
             },
             premultiplied: true,
+            id: 0,
         })
     };
     let shown = [layer(0, 0, 640), layer(10, 20, 32), None, None];
@@ -3216,4 +3220,102 @@ fn the_ap_switches_the_monitor_between_the_rates_of_its_size() {
             "DCP macOS set the display to 144000 mHz (advertised timing 1)",
         ]
     );
+}
+
+/// Each offer's layer count and the physical address of its first pixel.
+type Offers = alloc::sync::Arc<std::sync::Mutex<Vec<(usize, Option<u64>)>>>;
+
+/// A screen whose GPU takes every frame, recording each offer, or declines
+/// with a reason.
+struct GpuScreen {
+    offers: Offers,
+    frames: alloc::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    declines: Option<&'static str>,
+}
+impl Scanout for GpuScreen {
+    fn mode(&self) -> Mode {
+        MODE
+    }
+    fn present(&mut self, rows: &[u8]) -> Result<()> {
+        self.frames.lock().unwrap().push(rows.to_vec());
+        Ok(())
+    }
+    fn try_present_gpu(
+        &mut self,
+        layers: &[scanout::Layer],
+        _: Option<core::ops::Range<usize>>,
+        physical: &dyn Fn(u64) -> Option<u64>,
+    ) -> Result<scanout::GpuPresent> {
+        self.offers
+            .lock()
+            .unwrap()
+            .push((layers.len(), physical(layers[0].surface.iova)));
+        Ok(match self.declines {
+            Some(reason) => scanout::GpuPresent::Declined(reason),
+            None => scanout::GpuPresent::Taken,
+        })
+    }
+}
+
+#[test]
+fn a_composed_present_goes_to_the_gpu_and_falls_back_to_the_cpu_reported_once() {
+    for declines in [None, Some("no GPU composition here")] {
+        let offers = Offers::default();
+        let frames = alloc::sync::Arc::default();
+        let screen = GpuScreen {
+            offers: alloc::sync::Arc::clone(&offers),
+            frames: alloc::sync::Arc::clone(&frames),
+            declines,
+        };
+        let mut methods = Methods::new(Box::new(screen), interface());
+        let mut ram = guest_ram();
+        let submits = compose_swaps(&mut methods);
+        let mut completed = 0;
+        for (step, input) in submits.iter().enumerate() {
+            assert_eq!(returned(methods.call(*b"A407", input, 0xc)), [0; 12]);
+            let compose = methods
+                .compose(step as u64 * 1_000_000, DART_PAGE, resolve)
+                .expect("pages resolve");
+            compose.run(&mut ram);
+            assert!(methods.finish_compose(0).unwrap());
+            while let Some(callback) = methods.take_callback() {
+                completed += usize::from(callback.tag == SWAP_COMPLETE);
+                (callback.then)(&mut methods, &[]).unwrap();
+            }
+        }
+        let offers = offers.lock().unwrap().clone();
+        assert_eq!(offers.len(), submits.len());
+        assert!(
+            offers
+                .iter()
+                .all(|&(layers, first)| layers >= 1 && first.is_some())
+        );
+        // Every swap completes either way; only the fallback composes rows.
+        assert_eq!(completed, submits.len());
+        let composed = (methods.pacing.gpu_composed, methods.pacing.cpu_composed);
+        let swaps = submits.len() as u32;
+        assert_eq!(
+            composed,
+            if declines.is_some() {
+                (0, swaps)
+            } else {
+                (swaps, 0)
+            }
+        );
+        let reports: Vec<_> = methods
+            .take_unmodeled()
+            .into_iter()
+            .filter(|line| line.contains("composes on the CPU"))
+            .collect();
+        match declines {
+            None => {
+                assert!(frames.lock().unwrap().is_empty());
+                assert!(reports.is_empty());
+            }
+            Some(reason) => {
+                assert!(!frames.lock().unwrap().is_empty());
+                assert_eq!(reports, [format!("IOMFB composes on the CPU: {reason}")]);
+            }
+        }
+    }
 }

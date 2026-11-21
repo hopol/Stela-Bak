@@ -262,7 +262,8 @@ unsafe extern "system" fn forward(
 /// `stela_metal_resolve_dispatches_kernel`, `stela_metal_store_texels_kernel`,
 /// `stela_metal_load_texels_kernel`, `stela_metal_average_samples_kernel`,
 /// `stela_metal_decode_etc_kernel`, `stela_metal_decode_pvrtc_kernel`,
-/// `stela_metal_reorder_blocks_kernel` and `stela_metal_decode_astc_kernel`
+/// `stela_metal_reorder_blocks_kernel`, `stela_metal_decode_astc_kernel` and
+/// `stela_metal_compose_kernel`
 /// (`compiler/metal_abi.h`).
 #[derive(Clone, Copy, Debug)]
 pub struct InternalKernels {
@@ -303,6 +304,10 @@ pub struct InternalKernels {
     /// Decodes a buffer's ASTC LDR blocks into a texture's image as
     /// [`decode_etc`](Self::decode_etc) does.
     pub decode_astc: ShaderCode,
+    /// Blends display layers into a scanout buffer's rows per
+    /// [`ComposeArguments`](super::binding::ComposeArguments), one thread
+    /// per pixel in workgroups of `WORKGROUP_SIZE`.
+    pub compose: ShaderCode,
 }
 
 /// How the driver takes memory a CPU reaches: its kernel driver maps a dma-buf.
@@ -573,9 +578,12 @@ pub struct NativeBackend {
     /// The driver work calls do outside the service's turn: imports'
     /// exports and allocations, and frees of evicted kept imports.
     outside: Arc<NativeOutside>,
-    /// What each imported memory came from, its token and the guest RAM
-    /// it views.
-    imports: BTreeMap<u64, (ExportedMemory, NonZeroU64, Vec<MemoryRange>)>,
+    /// What each imported memory came from, its token, none for guest RAM
+    /// the device reads for itself, and the guest RAM it views.
+    imports: BTreeMap<u64, (ExportedMemory, Option<NonZeroU64>, Vec<MemoryRange>)>,
+    /// Memory of dma-bufs other drivers made, by its handle: no host
+    /// mapping, no token.
+    foreign: alloc::collections::BTreeSet<u64>,
     /// Imports freed lately, oldest first, kept bound: the same guest RAM
     /// imported again takes one back with no host kernel call
     /// ([`ImportCache`]).
@@ -613,6 +621,7 @@ pub struct NativeBackend {
     decode_pvrtc: vk::Pipeline,
     reorder_blocks: vk::Pipeline,
     decode_astc: vk::Pipeline,
+    compose: vk::Pipeline,
     /// The cache compiled pipelines read and fill, kept across boots.
     store: pipeline_store::Persisted,
     /// Pipeline creations deferred outside the service's turn.
@@ -847,6 +856,7 @@ impl NativeBackend {
             outside,
             exporter: ManuallyDrop::new(exporter),
             imports: BTreeMap::new(),
+            foreign: alloc::collections::BTreeSet::new(),
             import_cache: ImportCache::default(),
             retired: VecDeque::new(),
             image_dedicated: alloc::collections::BTreeSet::new(),
@@ -868,6 +878,7 @@ impl NativeBackend {
             decode_pvrtc: vk::Pipeline::null(),
             reorder_blocks: vk::Pipeline::null(),
             decode_astc: vk::Pipeline::null(),
+            compose: vk::Pipeline::null(),
             store: pipeline_store::Persisted::none(loader.log),
             deferral: deferral::Deferral::default(),
             premade: premade::Premade::default(),
@@ -902,6 +913,7 @@ impl NativeBackend {
         backend.decode_pvrtc = backend.create_compute(&kernel(kernels.decode_pvrtc))?;
         backend.reorder_blocks = backend.create_compute(&kernel(kernels.reorder_blocks))?;
         backend.decode_astc = backend.create_compute(&kernel(kernels.decode_astc))?;
+        backend.compose = backend.create_compute(&kernel(kernels.compose))?;
         Ok(backend)
     }
 
@@ -1356,12 +1368,12 @@ impl NativeBackend {
 
     /// Takes an imported `VkDeviceMemory` as [`Memory`]: the host reaches it
     /// through the export's mapping (Linux has no pages to map for an
-    /// imported buffer), and freeing it retires `token`.
+    /// imported buffer), and freeing it retires `token`, if any.
     fn own_import(
         &mut self,
         memory: vk::DeviceMemory,
         exported: ExportedMemory,
-        token: NonZeroU64,
+        token: Option<NonZeroU64>,
         ranges: Vec<MemoryRange>,
     ) -> Memory {
         self.mappings.insert(
@@ -1379,6 +1391,53 @@ impl NativeBackend {
         })
     }
 
+    /// Whether the memory of handle `key` is a dma-buf's, which a buffer
+    /// bound to it declares.
+    fn external(&self, key: u64) -> bool {
+        self.imports.contains_key(&key) || self.foreign.contains(&key)
+    }
+
+    /// An import of the wired guest RAM of `ranges`, whose freeing retires
+    /// `token`, if any.
+    fn import_ranges(
+        &mut self,
+        ranges: &[MemoryRange],
+        token: Option<NonZeroU64>,
+    ) -> Result<Memory> {
+        // The same guest RAM imported again: a freed import of it views the
+        // same pages, still bound.
+        if let Some(kept) = self.import_cache.take(ranges) {
+            self.mappings.insert(
+                raw(kept.memory),
+                Mapping {
+                    pointer: kept.exported.pointer,
+                    size: kept.exported.bytes,
+                    coherent: true,
+                },
+            );
+            self.imports
+                .insert(raw(kept.memory), (kept.exported, token, kept.ranges));
+            return Ok(self.memories.insert(memory::Allocation::Whole {
+                memory: kept.memory,
+                resource: false,
+            }));
+        }
+        let exported = self.exporter.export(ranges)?;
+        let imported = match self.outside.import_type() {
+            Some(index) => Ok(index),
+            None => self.import_memory_type(exported.fd),
+        };
+        let index = match imported {
+            Ok(index) => index,
+            Err(error) => {
+                self.exporter.close(exported);
+                return Err(error);
+            }
+        };
+        let memory = self.outside.allocate_import(&exported, index)?;
+        Ok(self.own_import(memory, exported, token, ranges.to_vec()))
+    }
+
     /// Frees `memory`: returns a place to its block, or frees a whole
     /// allocation. A freed import retires its token and is kept for the
     /// same guest RAM's next import ([`ImportCache`]).
@@ -1388,6 +1447,7 @@ impl NativeBackend {
         };
         if let memory::Allocation::Whole { memory, .. } = allocation {
             self.image_dedicated.remove(&raw(memory));
+            self.foreign.remove(&raw(memory));
         }
         if let memory::Allocation::Whole { memory, resource } = allocation
             && let Some((exported, token, ranges)) = self.imports.remove(&raw(memory))
@@ -1397,7 +1457,7 @@ impl NativeBackend {
             }
             self.mappings.remove(&raw(memory));
             self.zeroing.forget(&self.device, memory);
-            self.retired.push_back(token);
+            self.retired.extend(token);
             for evicted in self.import_cache.keep(ranges, memory, exported) {
                 self.unbound.push(raw(evicted.memory));
                 self.free_after_turn(Freed {
@@ -2047,6 +2107,7 @@ impl Drop for NativeBackend {
             self.device.destroy_pipeline(self.decode_pvrtc, None);
             self.device.destroy_pipeline(self.reorder_blocks, None);
             self.device.destroy_pipeline(self.decode_astc, None);
+            self.device.destroy_pipeline(self.compose, None);
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_pipeline_layout(self.layout, None);
             self.device.destroy_sampler(self.null_sampler, None);
@@ -2637,38 +2698,33 @@ impl Backend for NativeBackend {
     }
 
     fn import_memory(&mut self, ranges: &[MemoryRange], token: NonZeroU64) -> Result<Memory> {
-        // The same guest RAM imported again: a freed import of it views the
-        // same pages, still bound.
-        if let Some(kept) = self.import_cache.take(ranges) {
-            self.mappings.insert(
-                raw(kept.memory),
-                Mapping {
-                    pointer: kept.exported.pointer,
-                    size: kept.exported.bytes,
-                    coherent: true,
-                },
-            );
-            self.imports
-                .insert(raw(kept.memory), (kept.exported, token, kept.ranges));
-            return Ok(self.memories.insert(memory::Allocation::Whole {
-                memory: kept.memory,
-                resource: false,
-            }));
-        }
-        let exported = self.exporter.export(ranges)?;
-        let imported = match self.outside.import_type() {
-            Some(index) => Ok(index),
-            None => self.import_memory_type(exported.fd),
-        };
-        let index = match imported {
-            Ok(index) => index,
-            Err(error) => {
-                self.exporter.close(exported);
-                return Err(error);
-            }
-        };
-        let memory = self.outside.allocate_import(&exported, index)?;
-        Ok(self.own_import(memory, exported, token, ranges.to_vec()))
+        self.import_ranges(ranges, Some(token))
+    }
+
+    fn import_own(&mut self, ranges: &[MemoryRange]) -> Result<Memory> {
+        self.import_ranges(ranges, None)
+    }
+
+    fn import_dma_buf(&mut self, fd: i32, bytes: u64) -> Result<Memory> {
+        let index = self.import_memory_type(fd)?;
+        let mut from_fd = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(DMA_BUF)
+            .fd(fd);
+        let mut flags =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let allocate = vk::MemoryAllocateInfo::default()
+            .allocation_size(bytes)
+            .memory_type_index(index)
+            .push_next(&mut flags)
+            .push_next(&mut from_fd);
+        // SAFETY: the allocate info and its chain outlive the call; the
+        // driver owns `fd` once the import succeeds.
+        let memory = unsafe { self.device.allocate_memory(&allocate, None) }.map_err(failure)?;
+        self.foreign.insert(raw(memory));
+        Ok(self.memories.insert(memory::Allocation::Whole {
+            memory,
+            resource: false,
+        }))
     }
 
     fn keeps_import(&self, ranges: &[MemoryRange]) -> bool {
@@ -2694,7 +2750,7 @@ impl Backend for NativeBackend {
             exported,
             ranges,
         } = *made;
-        Ok(self.own_import(memory, exported, token, ranges))
+        Ok(self.own_import(memory, exported, Some(token), ranges))
     }
 
     fn retired(&mut self) -> Option<NonZeroU64> {
@@ -2716,7 +2772,7 @@ impl Backend for NativeBackend {
             unsafe { self.device.create_buffer(create, None) }.map_err(failure)
         };
         let resolved = self.resolve(memory)?;
-        let buffer = if self.imports.contains_key(&raw(resolved.memory)) {
+        let buffer = if self.external(raw(resolved.memory)) {
             objects::imported_buffer(info, DMA_BUF, create)
         } else {
             objects::buffer(info, create)
@@ -3184,6 +3240,36 @@ impl Backend for NativeBackend {
         }
     }
 
+    fn write_memory_rows(
+        &mut self,
+        memory: Memory,
+        offset: u64,
+        length: u64,
+        rows: &mut dyn Iterator<Item = &[u8]>,
+    ) -> Result<()> {
+        let mapped = self.mapping(memory, offset, length)?;
+        let mut at = 0;
+        for row in rows {
+            ensure(at + row.len() as u64 <= length, "the rows fill the range")?;
+            // SAFETY: `mapped` covers `length` bytes, of which the row's
+            // lie within, and the slice is disjoint from device memory.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    row.as_ptr(),
+                    mapped.pointer.as_ptr().add(at as usize),
+                    row.len(),
+                );
+            }
+            at += row.len() as u64;
+        }
+        ensure(at == length, "the rows fill the range")?;
+        if mapped.coherent {
+            Ok(())
+        } else {
+            self.flush_range(mapped.memory, mapped.offset, length)
+        }
+    }
+
     fn read_memory(&mut self, memory: Memory, offset: u64, bytes: &mut [u8]) -> Result<()> {
         let mapped = self.mapping(memory, offset, bytes.len() as u64)?;
         if !mapped.coherent {
@@ -3520,7 +3606,7 @@ impl Backend for NativeBackend {
             // SAFETY: the create info outlives the call.
             unsafe { self.device.create_buffer(create, None) }.map_err(failure)
         };
-        let buffer = if self.imports.contains_key(&raw(resolved.memory)) {
+        let buffer = if self.external(raw(resolved.memory)) {
             objects::imported_buffer(&info, DMA_BUF, create)
         } else {
             objects::buffer(&info, create)

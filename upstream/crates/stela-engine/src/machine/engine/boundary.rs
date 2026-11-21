@@ -19,7 +19,11 @@ pub const OUTSIDE_KINDS: usize = ExitKind::Amx as usize + 2;
 /// slowed by a PROCHOT# or FORCEPR# signal; and the last sample's degrees
 /// below the core's highest allowed temperature. `counters` and `thermal`
 /// say which of the two register sets the core has; a host that has
-/// neither leaves both false.
+/// neither leaves both false. Where the core has them, the same samples
+/// count its package over its thermal limit, held by a package power limit
+/// or slowed by PROCHOT (`package`), its turbo or boost switched off
+/// (`switch`), and its highest allowed P-state below the fastest
+/// (`limit`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HostClock {
     pub actual: u64,
@@ -31,6 +35,14 @@ pub struct HostClock {
     pub headroom: Option<u8>,
     pub counters: bool,
     pub thermal: bool,
+    pub package_hot: u64,
+    pub package_power: u64,
+    pub package_prochot: u64,
+    pub turbo_off: u64,
+    pub limited: u64,
+    pub package: bool,
+    pub switch: bool,
+    pub limit: bool,
 }
 
 /// One PE's System registers that take none of the board's locks, as
@@ -74,6 +86,13 @@ pub trait PassiveRegisters: Send + Sync {
     /// The value a `bytes`-byte read at `physical` returns, if this serves
     /// it; `None` sends the read to [`Devices::read_scalar`].
     fn read(&self, physical: u64, bytes: u8) -> Option<u64>;
+    /// The word itself a `bytes`-byte read at `physical` loads, where this
+    /// serves it from one: native code reads it again at the same site
+    /// while it holds the value the engine read, the word being its own
+    /// epoch ([`PlainRead`]). `None` leaves every such read to the engine.
+    fn word(&self, _physical: u64, _bytes: u8) -> Option<Arc<core::sync::atomic::AtomicU64>> {
+        None
+    }
 }
 
 /// Device registers every PE reaches under the device's own lock instead of
@@ -410,6 +429,25 @@ pub trait Host {
     fn native_view(&mut self, _from: &Regime, _to: &Regime) -> Option<NativeView> {
         None
     }
+    /// The host's root sets as native TTBR0 switches load them
+    /// (`x86_64::table_switch::Sets`), and how native code reaches CR3:
+    /// `None` on a host whose translations need no CR3 load, where a native
+    /// switch changes the guest's state alone.
+    fn native_sets(&mut self) -> Option<(u64, table_switch::Cr3)> {
+        None
+    }
+    /// The set that holds what `controls` translate, as
+    /// [`Host::set_regime`] last kept it, if it differs from the current
+    /// regime's controls only in TTBR0 and a native switch may load it:
+    /// its index and generation (`x86_64::table_switch::Entry::set`).
+    fn native_set(&mut self, _controls: &mmu::Controls) -> Option<(u64, u64)> {
+        None
+    }
+    /// Whether [`Host::isolate_predictions`] issues IBPB and refills the
+    /// return stack, which a native TTBR0 switch then issues itself.
+    fn isolates_predictions(&self) -> bool {
+        false
+    }
     /// The PE invalidated instruction caches (IC IVAU of `Some(page)`, a
     /// physical page; IC IALLU or IALLUIS for `None`), which this machine
     /// already applied to its own compiled code. A host that runs other
@@ -480,6 +518,18 @@ pub trait Host {
     /// samples where its time goes names the exit kind.
     fn profile_exit(&mut self, _slot: usize, now: u64) {
         self.profile_boundary(step_timing::Phase::Exit, now);
+    }
+    /// Under `--profile`, a waiting PE starts (`true`) or ends (`false`)
+    /// its spin for a wake before it halts: a host that samples where its
+    /// time goes counts that time as idle rather than as the scheduler's
+    /// ([`step_timing::Phase::Schedule`]), which holds it.
+    fn profile_idle(&mut self, _idle: bool) {}
+    /// The profile ticks ([`Self::profile_ticks`]) at which the last native
+    /// run was entered and returned, as close to native code as the host
+    /// keeps them; 0 where it keeps none. Under `--profile` they bound a
+    /// traced System exit's round trip ([`step_timing::ExitTrace`]).
+    fn native_stamps(&self) -> [u64; 2] {
+        [0; 2]
     }
     /// Under `--profile`, the `bytes` of code just installed at `code` are
     /// `regions`: `(offset, region)` pairs in ascending offsets, each
@@ -1140,16 +1190,18 @@ impl Devices for NoDevices {
 }
 
 /// What native code does to move a host to another view of one regime
-/// ([`Host::native_view`]), as `x86_64::transition::Record` keeps it: load
-/// `cr3` while the word at `root_at` is still `root` and the byte at
-/// `stale_at` clear, write `view` to the word at `view_at`, and leave
-/// RFLAGS.AC as `ac` says.
+/// ([`Host::native_view`]), as `x86_64::transition::Record` keeps it: while
+/// the current set of the host's root sets at `sets`
+/// (`x86_64::table_switch::Sets`) is of class `class`, load CR3 for that
+/// set's root of view `root` (in its PCID, flushing it if stale), write
+/// `view` to the word at `view_at`, and leave RFLAGS.AC as `ac` says.
+/// Sets of one class differ in TTBR0 alone, so a record made in one set
+/// holds after the PE switched to another of its class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeView {
-    pub cr3: u64,
-    pub root_at: u64,
+    pub sets: u64,
     pub root: u64,
-    pub stale_at: u64,
+    pub class: u64,
     pub view_at: u64,
     pub view: u64,
     pub ac: u64,

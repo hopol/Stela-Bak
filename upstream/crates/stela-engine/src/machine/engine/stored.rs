@@ -133,6 +133,14 @@ pub struct SharedTranslation {
     page: u64,
     pc: u64,
     context: Digest,
+    /// The guest-physical frame of its fetch page.
+    frame: u64,
+    /// Prepared ahead of any fetch (`ahead.rs`), not offered for the
+    /// pack yet: the PE that first installs it offers it.
+    ahead: bool,
+    /// A block prepared ahead: the entry PCs of its static successors,
+    /// which its first install offers as a fetched block's. None otherwise.
+    successors: Vec<u64>,
 }
 impl SharedTranslation {
     pub fn input(&self) -> &[u8] {
@@ -143,6 +151,34 @@ impl SharedTranslation {
     }
     pub fn preparation(&self) -> &Arc<Preparation> {
         &self.emission.preparation
+    }
+    /// Whether it was prepared ahead of any fetch and not offered since.
+    pub fn ahead(&self) -> bool {
+        self.ahead
+    }
+    /// The entry PCs of its static successors, kept for a block prepared
+    /// ahead.
+    pub fn successors(&self) -> &[u64] {
+        &self.successors
+    }
+    /// The offer of a block prepared ahead, made by the PE that installs it
+    /// first: the store keeps it for the pack as any block compiled anew,
+    /// and its successors (`elsewhere`: in other pages, with the frames
+    /// the installing PE's fetch cache holds) become jobs as a fetched
+    /// block's do.
+    pub(super) fn offer(&self, quiet: bool, elsewhere: Vec<(u64, u64)>) -> Offer {
+        Offer {
+            key: self.key,
+            page: self.page,
+            pc: self.pc,
+            context: self.context,
+            emission: self.emission.clone(),
+            successors: self.successors.clone(),
+            elsewhere,
+            quiet,
+            frame: self.frame,
+            depth: 0,
+        }
     }
     pub(super) fn matches(&self, key: &Digest, pc: u64, context: &Digest, source: &[u8]) -> bool {
         self.key == *key
@@ -184,11 +220,29 @@ fn translation_bytes(emission: &Emission) -> usize {
     )
 }
 
+/// What a store's lookup of a page key found ([`Translations::lookup`]).
+#[derive(Debug, Clone)]
+pub enum Looked {
+    /// The page's valid record.
+    Found(Arc<StoredRecord>),
+    /// No valid record: the page's bytes are not looked up again this boot.
+    Absent,
+    /// A record the store reads meanwhile (a pack segment left in the
+    /// file): the block compiles now, and a later fetch in the page asks
+    /// again.
+    Awaited,
+}
+
 /// The store a host keeps for the engine.
 pub trait Translations {
     /// The record of the page whose bytes hash to `key`, if the store has
     /// a valid one.
     fn record(&mut self, key: &Digest) -> Option<Arc<StoredRecord>>;
+    /// [`Self::record`], saying whether a missing record is absent or
+    /// being read.
+    fn lookup(&mut self, key: &Digest) -> Looked {
+        self.record(key).map_or(Looked::Absent, Looked::Found)
+    }
     /// The block at `pc` of the page whose bytes hash to `key`, prepared
     /// in `context` at that very PC since the record was read, if the
     /// store has one: shared, so a store other machines reach copies none
@@ -204,6 +258,10 @@ pub trait Translations {
     }
     /// A block the engine compiled from a page the store had no entry for.
     fn offer(&mut self, offer: Offer);
+    /// The stored form this translator gives a block of the previous
+    /// translator's pack, of the page whose bytes hash to `key`
+    /// (`refill.rs`), for the store to keep as it keeps an offer's.
+    fn refilled(&mut self, _key: &Digest, _entry: Entry) {}
     /// What a machine's use of the store cost or found, for the store's
     /// counters.
     fn note(&mut self, _event: StoreEvent) {}
@@ -235,6 +293,12 @@ pub enum StoreEvent {
     /// A shared block was found but not installed: its admitted bytes or
     /// source extent differ from the fetch's.
     SharedRejected,
+    /// A fetch page's record was being read at its lookup
+    /// ([`Looked::Awaited`]).
+    AwaitedPage,
+    /// Such a page was looked up again at a later fetch in it, and whether
+    /// its record was there then.
+    LookedAgain { found: bool },
 }
 
 /// A block compiled anew, and how it was compiled. Emission fields are private;
@@ -258,9 +322,18 @@ pub struct Offer {
     /// The entry PCs of its static successors, for translation ahead of
     /// execution.
     pub(super) successors: Vec<u64>,
+    /// Those of them in other pages, each with the frame of its page where
+    /// the offering PE's fetch cache held its walk, else 0 (`ahead.rs`).
+    pub(super) elsewhere: Vec<(u64, u64)>,
     /// Compiled for EL0, where the PE holds no lock of the guest's kernel:
     /// a store may take time there for work of its own.
     pub(super) quiet: bool,
+    /// The guest-physical frame of its fetch page, which a PE preparing its
+    /// successors ahead reads (`ahead.rs`).
+    pub(super) frame: u64,
+    /// 0 for a block a fetch compiled; for one prepared ahead, how many
+    /// static successor steps it lies from one (`ahead.rs` DEPTH).
+    pub(super) depth: u8,
 }
 
 impl Offer {
@@ -289,7 +362,10 @@ impl Offer {
             context,
             emission: Arc::new(Emission::new(input, block, preparation)),
             successors: Vec::new(),
+            elsewhere: Vec::new(),
             quiet: false,
+            frame: 0,
+            depth: 0,
         })
     }
     pub fn key(&self) -> Digest {
@@ -336,7 +412,18 @@ impl Offer {
             page: self.page,
             pc: self.pc,
             context: self.context,
+            frame: self.frame,
+            ahead: self.depth > 0,
+            successors: match self.depth > 0 {
+                true => self.successors,
+                false => Vec::new(),
+            },
         })
+    }
+
+    /// Whether it was prepared ahead of any fetch (`ahead.rs`).
+    pub fn ahead(&self) -> bool {
+        self.depth > 0
     }
 
     /// Its block's stored form ([`stored_entry`]).
@@ -389,6 +476,9 @@ pub(super) struct StoredPage {
     pub(super) key: Digest,
     pub(super) bytes: Box<[u8; PAGE_BYTES]>,
     pub(super) record: Option<Arc<StoredRecord>>,
+    /// Its record was being read at the last lookup: the next fetch in the
+    /// page looks again.
+    awaited: bool,
     /// The latest installed block's, which the next of this page shares.
     origin: Option<Arc<StoredOrigin>>,
     /// `Machine::page_uses` at its last use.
@@ -418,7 +508,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if let Some(stored) = self.pages.get_mut(&frame) {
             if matches(stored.bytes.as_slice()) {
                 stored.used = self.page_uses;
-                return Some((stored.key, stored.record.clone()));
+                let (key, awaited) = (stored.key, stored.awaited);
+                if awaited {
+                    self.look_again(frame, key);
+                }
+                let stored = &self.pages[&frame];
+                return Some((key, stored.record.clone()));
             }
             self.forget_stored_page(frame);
         }
@@ -443,16 +538,29 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return None;
         }
         let (key, check, absent) = self.page_key(frame, &bytes);
-        let record = match absent {
+        let looked = match absent {
             true => {
                 self.statistics.known_absent += 1;
-                None
+                Looked::Absent
             }
-            false => self.host.translations()?.record(&key),
+            false => self.host.translations()?.lookup(&key),
         };
-        if record.is_none() && !absent {
-            self.note_absent(frame, check, key);
-        }
+        let (record, awaited) = match looked {
+            Looked::Found(record) => (Some(record), false),
+            Looked::Absent => {
+                if !absent {
+                    self.note_absent(frame, check, key);
+                }
+                (None, false)
+            }
+            Looked::Awaited => {
+                self.statistics.awaited_pages += 1;
+                if let Some(translations) = self.host.translations() {
+                    translations.note(StoreEvent::AwaitedPage);
+                }
+                (None, true)
+            }
+        };
         let ticks = self.host.counter().wrapping_sub(reading);
         if let Some(translations) = self.host.translations() {
             translations.note(StoreEvent::PageRead { ticks });
@@ -466,6 +574,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 key,
                 bytes,
                 record: record.clone(),
+                awaited,
                 origin: None,
                 used: self.page_uses,
             },
@@ -475,6 +584,34 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.stored_pages_peak = self.stored_pages_peak.max(self.pages.len());
         }
         Some((key, record))
+    }
+
+    /// Look up again the record `key` of the kept page at `frame`, which
+    /// was being read: once found it serves the page's next blocks, and
+    /// once proven absent the page is known absent.
+    fn look_again(&mut self, frame: u64, key: Digest) {
+        let Some(translations) = self.host.translations() else {
+            return;
+        };
+        let looked = translations.lookup(&key);
+        let found = matches!(looked, Looked::Found(_));
+        translations.note(StoreEvent::LookedAgain { found });
+        self.statistics.awaited_lookups += 1;
+        let Some(stored) = self.pages.get_mut(&frame) else {
+            return;
+        };
+        match looked {
+            Looked::Found(record) => {
+                stored.record = Some(record);
+                stored.awaited = false;
+            }
+            Looked::Absent => {
+                stored.awaited = false;
+                let check = page_check(&stored.bytes);
+                self.note_absent(frame, check, key);
+            }
+            Looked::Awaited => {}
+        }
     }
 
     /// The page key of `bytes`, the fetch page at `frame`, and their check:

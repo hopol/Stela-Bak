@@ -36,6 +36,7 @@ const MARKER_MEMORY: MemoryRequest = MemoryRequest {
     mapped: true,
 };
 
+pub mod display;
 mod execution_sets;
 #[cfg(test)]
 pub(crate) mod fixture;
@@ -171,6 +172,8 @@ pub struct Device<B: Backend, C: Compiler> {
     /// The most deferred bytes that only held work kept ([`DeviceMemory`]).
     peak_pinned: u64,
     allocated: u64,
+    /// Display layers composed from a device copy of their planes.
+    display_copies: u64,
     /// The allocations that ran out of memory ([`reclaim`]).
     shortage: reclaim::Shortage,
     /// The service's lock, which says when the platform withdrew a host
@@ -390,6 +393,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             release_serial: None,
             peak_pinned: 0,
             allocated: 0,
+            display_copies: 0,
             shortage: reclaim::Shortage::default(),
             host_calls: None,
             memory_cap: crate::metal::vulkan::physical::VRAM_CAP,

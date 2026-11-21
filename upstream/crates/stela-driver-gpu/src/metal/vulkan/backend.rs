@@ -25,7 +25,7 @@ use super::{
 use crate::metal::{
     binding::HeapArray,
     command_buffer::Segment,
-    error::{Error, Result},
+    error::{Error, Result, ensure},
 };
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{any::Any, num::NonZeroU64};
@@ -236,6 +236,18 @@ pub trait Backend {
     /// The wired guest RAM of `ranges`, which the GPU reaches where it is.
     /// Destroying the memory lets [`Self::retired`] answer `token`.
     fn import_memory(&mut self, ranges: &[MemoryRange], token: NonZeroU64) -> Result<Memory>;
+    /// [`Self::import_memory`] of guest RAM the device reads for itself, as
+    /// a display layer's, whose destruction retires no token.
+    fn import_own(&mut self, _ranges: &[MemoryRange]) -> Result<Memory> {
+        Err(Error::Unsupported("imports of guest RAM for the device"))
+    }
+    /// The memory of a dma-buf another driver made, `bytes` long, which the
+    /// device reaches and nothing maps: a display's scanout buffer. The
+    /// driver owns `fd` once this succeeds; the caller still does after an
+    /// error.
+    fn import_dma_buf(&mut self, _fd: i32, _bytes: u64) -> Result<Memory> {
+        Err(Error::Unsupported("dma-buf imports"))
+    }
     /// Whether an import of exactly `ranges` takes back memory kept from
     /// an earlier one, with no driver call.
     fn keeps_import(&self, _ranges: &[MemoryRange]) -> bool {
@@ -383,6 +395,21 @@ pub trait Backend {
     }
     /// Copies into mapped memory and flushes it.
     fn write_memory(&mut self, memory: Memory, offset: u64, bytes: &[u8]) -> Result<()>;
+    /// Copies `rows` one after another into the `length` mapped bytes at
+    /// `offset`, which they fill, and flushes them: a caller's padded rows
+    /// without packing them first.
+    fn write_memory_rows(
+        &mut self,
+        memory: Memory,
+        offset: u64,
+        length: u64,
+        rows: &mut dyn Iterator<Item = &[u8]>,
+    ) -> Result<()> {
+        let mut packed = Vec::with_capacity(length as usize);
+        rows.for_each(|row| packed.extend_from_slice(row));
+        ensure(packed.len() as u64 == length, "the rows fill the range")?;
+        self.write_memory(memory, offset, &packed)
+    }
     /// Invalidates mapped memory and copies out of it.
     fn read_memory(&mut self, memory: Memory, offset: u64, bytes: &mut [u8]) -> Result<()>;
     /// `vkFlushMappedMemoryRanges` after CPU writes through another mapping.

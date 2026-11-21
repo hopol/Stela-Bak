@@ -3,7 +3,7 @@
 //! left for the guest, and what is left of it for the translation pack.
 use crate::Result;
 use crate::native_resources::{
-    CODE_ALIGNMENT, CodeReservation, SMALL_WINDOW_PER_RUNNER, WINDOW_PER_RUNNER,
+    CODE_ALIGNMENT, CodeReservation, MAX_WINDOW, SMALL_WINDOW_PER_RUNNER, WINDOW_PER_RUNNER,
     code_reservation_within, parked_reserve, window_share,
 };
 use stela_contracts::refuse;
@@ -118,11 +118,39 @@ pub const PACK_FLOOR: u64 = 64 * MIB;
 /// the storage drivers' rings and the firmware ranges' rounding to 2 MiB.
 const PACK_MARGIN: u64 = 16 * MIB;
 
+/// The engine heap's share (a fraction's denominator) that held compiled
+/// code beside the window before one budget held both: the blocks PEs
+/// share as they compile and the stored forms of blocks the ring took away
+/// (`translations::share`).
+pub const CODE_SHARE: u64 = 8;
+/// The heap's share the pack's decoded records took (`translations::bounds`
+/// before one budget held them).
+pub const DECODED_SHARE: u64 = 64;
+/// What of those shares code beside the window keeps at least: the blocks
+/// shared at compile time took a quarter of the first, and the decoded
+/// records keep what they had.
+const KEPT_FLOOR_SHARE: u64 = 32;
+
+/// The heap's code beside the window before the budget: the code share and
+/// the decoded records' share.
+fn kept_share(heap: u64) -> u64 {
+    heap / CODE_SHARE + heap / DECODED_SHARE
+}
+
+/// The least of it the budget leaves.
+fn kept_floor(heap: u64) -> u64 {
+    heap / KEPT_FLOOR_SHARE + heap / DECODED_SHARE
+}
+
 /// The parts' sizes and the guest DRAM left after them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sizes {
     pub heap: u64,
     pub code: CodeReservation,
+    /// The heap bytes for compiled code beside the window: blocks shared
+    /// at compile time and the stored forms of blocks the window let go
+    /// ([`code_budget`]).
+    pub kept: u64,
     pub pool: u64,
     /// Free RAM after the three parts; Stela's stacks, tables and image
     /// take a few more MiB of it.
@@ -202,17 +230,108 @@ impl Shortfall {
 ///   code - pool) / 64`, solved for `pool`; at least [`POOL_RUNNER_FLOOR`] per
 ///   runner, at most [`POOL_PER_RUNNER`] per sharer.
 ///
+/// Then the window takes what the code kept beside it in the heap held
+/// ([`code_budget`]): the guest and the pool stay as decided.
+///
 /// A guest share under [`GUEST_FLOOR`] is a [`Shortfall`].
 pub fn sizes(free: u64, cores: usize, runners: usize) -> Result<Sizes> {
     let estimate = estimate(free, cores, runners)?;
     if estimate.guest >= GUEST_FLOOR {
-        return Ok(estimate);
+        return Ok(code_budget(estimate));
     }
     let mut needed = free.next_multiple_of(NEEDED_STEP);
     while estimate_guest(needed, cores, runners)? < GUEST_FLOOR {
         needed += NEEDED_STEP;
     }
     Err(Shortfall { free, needed }.refusal())
+}
+
+/// The code window per runner past which a larger one cuts reinstalls
+/// steeply no more (the ring replay at 8 PEs: 816 MiB reinstalls 15 % of
+/// what 640 MiB does): a window under it takes a pack's room first.
+pub const KNEE_PER_RUNNER: u64 = 102 * MIB;
+/// The code window per runner up to which the window shares a pack's room
+/// with the guest (the replay at 8 PEs: 1999, 1021 and 449 reinstalls per
+/// heartbeat at 816, 1200 and 1616 MiB); past it the room is the guest's.
+pub const SHARED_PER_RUNNER: u64 = 202 * MIB;
+
+/// [`sizes`] on a host where the translation pack left `room` of its
+/// budget ([`pack_budget`]) unused, as a pack read on demand does: it holds
+/// its index and the records lookups ask for, not every record. The other
+/// parts are what they were while the pack held its budget, and the room
+/// goes to the code window (with its block records, [`HEAP_PER_WINDOW`] a
+/// window byte) and the guest ([`give_room`]).
+pub fn sizes_with_room(free: u64, cores: usize, runners: usize, room: u64) -> Result<Sizes> {
+    match sizes(free.saturating_sub(room), cores, runners) {
+        Ok(sizes) => Ok(give_room(sizes, room, runners)),
+        Err(_) => sizes(free, cores, runners),
+    }
+}
+
+/// `sizes` with `room` beside them: the window takes it up to the knee
+/// ([`KNEE_PER_RUNNER`] per runner), then half of what is left up to
+/// [`SHARED_PER_RUNNER`] per runner, within [`MAX_WINDOW`], in whole
+/// [`CODE_ALIGNMENT`]s; the guest takes the rest.
+fn give_room(sizes: Sizes, room: u64, runners: usize) -> Sizes {
+    let runners = runners.max(1) as u64;
+    let window = sizes.code.window;
+    let per_byte = 1 + HEAP_PER_WINDOW;
+    let knee = (KNEE_PER_RUNNER * runners).min(MAX_WINDOW);
+    let shared = (SHARED_PER_RUNNER * runners).min(MAX_WINDOW);
+    let first = knee.saturating_sub(window).min(room / per_byte);
+    let rest = room - first * per_byte;
+    let second = shared
+        .saturating_sub(window + first)
+        .min(rest / 2 / per_byte);
+    let grown = (first + second) / CODE_ALIGNMENT * CODE_ALIGNMENT;
+    Sizes {
+        heap: sizes.heap + HEAP_PER_WINDOW * grown,
+        code: CodeReservation {
+            bytes: sizes.code.bytes + grown,
+            window: window + grown,
+            ..sizes.code
+        },
+        guest: sizes.guest + room - grown * per_byte,
+        ..sizes
+    }
+}
+
+/// One budget for compiled code, the window's first: the window, its
+/// block records ([`HEAP_PER_WINDOW`]) and the code kept beside it in the
+/// heap (a [`CODE_SHARE`]th of the heap for blocks and stored forms, a
+/// [`DECODED_SHARE`]th for the pack's decoded records) are what they were,
+/// and of that the window takes as much as leaves the kept code a
+/// [`KEPT_FLOOR_SHARE`]th of the heap and the decoded records their share,
+/// up to the most a window takes. The heap gives the window's growth back (its records come in,
+/// twice as much kept code goes out), so the guest keeps its DRAM.
+///
+/// Code the window holds needs no stored form to come back from: the
+/// ring's tenured parts keep it. A window too small for what the guest
+/// runs again and again turns it all over each heartbeat, and the kept
+/// forms then turn over too (run 20261119-021855: 512 MiB of window and
+/// 504 MiB of kept forms on a 12 GiB host, both every 10 s, kept forms
+/// serving 25-190 thousand of 0.6-1.1 million installs a heartbeat).
+fn code_budget(sizes: Sizes) -> Sizes {
+    let window = sizes.code.window;
+    let kept = kept_share(sizes.heap);
+    let budget = 2 * HEAP_PER_WINDOW * window + kept;
+    let floor = kept_floor(sizes.heap);
+    let most = ((budget - floor) / (2 * HEAP_PER_WINDOW)).min(MAX_WINDOW) / CODE_ALIGNMENT
+        * CODE_ALIGNMENT;
+    if most <= window {
+        return Sizes { kept, ..sizes };
+    }
+    let grown = most - window;
+    Sizes {
+        heap: sizes.heap - HEAP_PER_WINDOW * grown,
+        code: CodeReservation {
+            bytes: sizes.code.bytes + grown,
+            window: most,
+            ..sizes.code
+        },
+        kept: budget - 2 * HEAP_PER_WINDOW * most,
+        ..sizes
+    }
 }
 
 /// The bytes of persistent translation pack the loader may read for
@@ -344,6 +463,7 @@ fn split(free: u64, heap: u64, code: CodeReservation, cores: usize, runners: usi
     Sizes {
         heap,
         code,
+        kept: kept_share(heap),
         pool,
         guest: rest.saturating_sub(pool),
     }

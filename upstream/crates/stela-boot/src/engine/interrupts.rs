@@ -374,6 +374,65 @@ stela_nmi_gate:
     answer = sym nmi_answer,
 );
 
+// The #PF gate: a fault from native code that the shadow fills from the
+// guest's tables returns without the full handler's extended-state save
+// and restore. The fill is soft-float Rust (`host::gate_fill`) that leaves
+// the vector registers as the fault found them, so the gate saves only the
+// registers the call may clobber. Every other fault, and one while an
+// entry image is outstanding (whose refusal the common path makes), goes
+// on to vector 14's stub with the stack as the processor left it. The
+// processor's frame with its error code leaves RSP on a 16-byte boundary;
+// nine pushes and eight bytes keep it there for the call.
+global_asm!(
+    r#"
+.global stela_pf_gate
+stela_pf_gate:
+    cmp qword ptr gs:[{active}], 0
+    jne stela_vector_14
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    sub rsp, 8
+    cld
+    mov qword ptr gs:[{active}], 1
+    mov rdi, [rsp + 80]
+    mov rsi, [rsp + 88]
+    mov rdx, [rsp + 104]
+    call {fill}
+    mov qword ptr gs:[{active}], 0
+    add rsp, 8
+    test al, al
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    jz stela_vector_14
+    add rsp, 8
+    iretq
+"#,
+    active = const host::local::XSTATE_ACTIVE_OFFSET,
+    fill = sym page_fault_gate,
+);
+
+/// Whether the #PF with error code `error` at `rip` with RFLAGS `rflags`
+/// is filled ([`host::gate_fill`]): the gate then returns to it.
+extern "sysv64" fn page_fault_gate(error: u64, rip: u64, rflags: u64) -> bool {
+    // A processor woken from an idle wait flushes what it skipped first.
+    crate::native_mmio::shootdown::wake();
+    host::gate_fill(error, rip, rflags, cr2())
+}
+
 /// Whether the NMI at `rip`, the interrupted stack at `rsp`, was owed by a
 /// `--profile` counter overflow ([`host::sampling::overflow`]), now
 /// sampled, or by a retirement's NMI, now answered
@@ -488,6 +547,7 @@ const _: () = ORDINARY_ENTRIES;
 unsafe extern "C" {
     static stela_vector_table: [usize; VECTOR_NUMBERS.len()];
     fn stela_nmi_gate();
+    fn stela_pf_gate();
 }
 
 fn gate(handler: usize, ist: u8) -> [u64; 2] {
@@ -571,6 +631,25 @@ pub(crate) unsafe fn enable_avx() {
 /// for its whole lifetime, including its parked state. Interrupts are disabled;
 /// no native execution/handler can still refer to preceding tables or GS state.
 pub(crate) unsafe fn install_on(tables: &'static mut Tables, handler: Handler) {
+    // SAFETY: the caller's.
+    unsafe { install_tables(tables, handler, false) }
+}
+
+/// [`install_on`] for a processor that only idles parked: it takes no
+/// processor index and no heap cache of the running processors'
+/// (`host::local::activate`).
+///
+/// # Safety
+/// As [`install_on`], and the processor runs nothing but its idle loop and
+/// the fatal report.
+pub(crate) unsafe fn install_parked(tables: &'static mut Tables, handler: Handler) {
+    // SAFETY: the caller's.
+    unsafe { install_tables(tables, handler, true) }
+}
+
+/// # Safety
+/// As [`install_on`].
+unsafe fn install_tables(tables: &'static mut Tables, handler: Handler, parked: bool) {
     if tables.xstate.is_some() {
         output::fatal("native xstate descriptor owner cannot be reinstalled");
     }
@@ -643,7 +722,7 @@ pub(crate) unsafe fn install_on(tables: &'static mut Tables, handler: Handler) {
         // Loading a GS selector above resets its base; establish the private
         // CPL0 record after GDT/segment setup, before making our IDT active.
         let retained_tables = tables as *const Tables;
-        host::local::activate(&mut tables.local, handler, retained_tables);
+        host::local::activate(&mut tables.local, handler, retained_tables, parked);
         let idt = &raw mut tables.idt;
         let table = &stela_vector_table;
         for (&vector, &handler) in VECTOR_NUMBERS.iter().zip(table) {
@@ -654,6 +733,11 @@ pub(crate) unsafe fn install_on(tables: &'static mut Tables, handler: Handler) {
         (*idt)[2] = gate(
             stela_nmi_gate as *const () as usize,
             interrupt_image::NMI_IST,
+        );
+        // A #PF first tries a fill without saving extended state.
+        (*idt)[14] = gate(
+            stela_pf_gate as *const () as usize,
+            interrupt_image::ist(14),
         );
         let pointer = Pointer {
             limit: (size_of::<[[u64; 2]; 256]>() - 1) as u16,
@@ -692,7 +776,9 @@ pub(crate) extern "sysv64" fn interrupt(frame: &mut Frame, saved: &SavedState<'_
                 host::pmu::fill_end();
             }
         }
-        13 | 6 => {
+        // A non-canonical address faults with #SS where RSP or RBP is the
+        // base, with #GP elsewhere.
+        12 | 13 | 6 => {
             if !host::pmu::fixup(frame) {
                 host::native_exception(frame, saved);
             }
@@ -843,13 +929,15 @@ pub fn fatal(frame: &Frame) -> ! {
     // a restart calls, is the firmware's: the stop it came from, if any, is
     // on the line before.
     if let Some(reason) = crate::stop_record::take_firmware_call().fault_reason(&alloc::format!(
-        "vector={} error={:#x} rip={:#x} cr2={:#x} rax={:#x} cr3={:#x}",
+        "vector={} error={:#x} rip={:#x} cr2={:#x} rax={:#x} cr3={:#x}; {}",
         frame.vector,
         frame.error,
         frame.rip,
         cr2(),
         frame.rax,
-        cr3()
+        cr3(),
+        // A page fault's address; any other vector's rip.
+        crate::stop_record::fault_place(if frame.vector == 14 { cr2() } else { frame.rip })
     )) {
         output::fatal(reason)
     }

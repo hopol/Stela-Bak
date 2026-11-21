@@ -448,6 +448,25 @@ impl<H: Host, D: Devices> Machine<H, D> {
             readable: 1,
             value: self.cpu.event_storage(),
         };
+        // The event stream native WFEs sample from the PE's last sample:
+        // kept while the sample is the one it was made from, or moved
+        // natively to, and the stream's controls are unchanged. None where
+        // native code reads no count.
+        if self.stream_sample != self.event_sample || self.event_sample.is_none() {
+            self.stream_sample = self.event_sample;
+            self.mirrors.stream = self
+                .event_sample
+                .filter(|_| self.clock.reads_natively())
+                .and_then(|sample| {
+                    let (next, period) = timer::sampled_event(&self.cpu, sample)?;
+                    Some(register_read::EventStream {
+                        next,
+                        period: period.unwrap_or(0),
+                        sampled: sample,
+                    })
+                })
+                .unwrap_or_default();
+        }
         self.mirrors.exclusive = register_read::Cell {
             readable: u64::from(self.cpu.monitor.is_none() && !self.monitor_tracing),
             value: self.cpu.reservation_word(),
@@ -596,6 +615,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
         } else {
             written.unwrap_or(0)
         };
+        if self.step_timing.is_some()
+            && timer_word(word).is_some_and(|(kind, _)| kind == TimerWord::Value)
+        {
+            let reason = self.timer_value_exit(written);
+            if let Some(timing) = &mut self.step_timing {
+                timing.levels.timer_value_exits[reason as usize] += 1;
+            }
+        }
         let step = self.register_access(word, access);
         let pstate = self.cpu.pstate;
         if step.is_err()
@@ -643,6 +670,47 @@ impl<H: Host, D: Devices> Machine<H, D> {
         step
     }
 
+    /// Why the MSR CNTV_TVAL_EL0 of `written` reached the engine, as the
+    /// native timer write tests it, under step timing.
+    fn timer_value_exit(&mut self, written: u64) -> step_timing::TimerExit {
+        use step_timing::TimerExit;
+        const HCR_E2H: u64 = 1 << 34;
+        let pstate = self.cpu.pstate;
+        if pstate.el != 2
+            || pstate.guarded
+            || timer::agt::present(self.cpu.registers.chip())
+            || self.cpu.read(SystemRegister::HCR_EL2) & HCR_E2H == 0
+        {
+            return TimerExit::State;
+        }
+        if self.mirrors[TIMER_COMPARE].readable == 0 || self.mirrors[TIMER_CONTROL].readable == 0 {
+            return TimerExit::Closed;
+        }
+        if self.mirrors.lines_until == 0 {
+            return if self.devices.own_fiq(self.current) {
+                TimerExit::LinesIpi
+            } else if self
+                .device_lines
+                .is_some_and(|(_, _, pe)| pe == self.current)
+            {
+                TimerExit::LinesMonitor
+            } else {
+                TimerExit::LinesDevices
+            };
+        }
+        let now = self.now();
+        let compare = self.cpu.registers.get(SystemRegister::CNTHV_CVAL_EL2, 0);
+        let control = self.cpu.registers.get(SystemRegister::CNTHV_CTL_EL2, 0);
+        let armed = control & (timer::ENABLE | timer::IMASK) == timer::ENABLE;
+        if armed && now >= compare && self.mirrors.timer_quiet.readable == 0 {
+            return TimerExit::High;
+        }
+        if armed && now.wrapping_add(written as u32 as i32 as u64) <= now {
+            return TimerExit::Now;
+        }
+        TimerExit::Native
+    }
+
     /// MSR of `WRITTEN[index]`: one that only reaches the register's
     /// storage opens its cell there, for a register that takes what the
     /// thunk's fixed bits say: the register the write reached may be
@@ -683,6 +751,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// engine's.
     fn table_base_write(&mut self, word: u32, access: RegisterAccess) -> Step {
         let before = self.completion_point();
+        let from = self.switch_point();
+        self.note_switch_miss(word, from.as_ref());
         self.plain_read = None;
         let step = self.register_access(word, access);
         let value = self
@@ -697,6 +767,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             .and_then(|(register, index)| self.cpu.registers.address(register, index));
         if let (Ok(()), true, Some(value)) = (&step, self.position() == before, value) {
             self.mirrors[TABLE_BASE_KEPT] = register_read::Cell { readable: 1, value };
+            if let Some(from) = from {
+                self.keep_table_switches(from, value);
+            }
         }
         step
     }

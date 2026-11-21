@@ -618,10 +618,20 @@ pub struct Statistics {
     /// The ITLB's fills, drops and forgotten contexts by where they came
     /// from, in `ItlbSource`'s order.
     pub itlb_sources: [u64; ItlbSource::COUNT],
+    /// The guest PCs of this PE's own TLBIs of everything (not those mail
+    /// brought) and how many each issued, the most frequent kept
+    /// ([`WholeTlbiSites`]).
+    pub whole_tlbi_sites: WholeTlbiSites,
+    /// Of those TLBIs, the ones that found the ITLB holding anything, and
+    /// the counter ticks of all of them in the engine's forgetting and in
+    /// the host's shadow, those two under step timing only.
+    pub whole_tlbi_times: [u64; 3],
     pub compiled: u64,
     /// Of `compiled`, the blocks that run their iterations inside
     /// themselves (`CompiledBlock::self_loop`).
     pub self_loops: u64,
+    /// Of `compiled`, the regions (`CompiledBlock::region`).
+    pub regions: u64,
     /// Counter ticks spent analyzing and compiling `compiled`.
     pub compile_ticks: u64,
     /// Blocks taken from the persistent translation store instead of
@@ -637,6 +647,9 @@ pub struct Statistics {
     /// instruction, a device-site page, a host breakpoint, no store),
     /// taken from the pack, taken from another PE.
     pub store_sources: [[u64; StoreSource::COUNT]; 2],
+    /// Of the `Shared` installs at EL0 and above, those of blocks a waiting
+    /// PE prepared ahead of any fetch ([`super::ahead`]).
+    pub ahead_installs: [u64; 2],
     /// Counter ticks spent, for blocks not yet installed, reading, hashing
     /// and looking up their fetch pages; finding `shared` blocks; and
     /// installing every block.
@@ -654,6 +667,10 @@ pub struct Statistics {
     /// Fetch pages read again whose known key the store held no record
     /// for: not looked up again.
     pub known_absent: u64,
+    /// Fetch pages whose record the store was reading at their lookup,
+    /// and the lookups again of such pages at later fetches in them.
+    pub awaited_pages: u64,
+    pub awaited_lookups: u64,
     /// Blocks offered to the store while memory was low.
     pub offered_low: u64,
     /// Fetches whose page the store held a record for that gave no block:
@@ -680,6 +697,9 @@ pub struct Statistics {
     /// Why GENTER, GEXIT, SVC and ERET took the engine path, by kind
     /// (`x86_64::transition`) and `transitions::miss` reason.
     pub transition_misses: [[u64; super::transitions::miss::REASONS]; transition::KINDS],
+    /// Why TTBR0 writes that change the register took the engine path, by
+    /// `table_switches::miss` reason.
+    pub switch_misses: [u64; super::table_switches::miss::REASONS],
     /// Why runs ended at a branch-kind exit, by kind (fallthrough, direct,
     /// indirect, call, return) and [`BranchMiss`] reason; the last slot
     /// counts those of each kind whose run made a native transition.
@@ -716,8 +736,10 @@ pub struct Statistics {
     /// everything.
     pub tlb_maintenance: u64,
     pub scoped_maintenance: u64,
-    /// TTBR0 writes, which drop the lower half's.
+    /// TTBR0 writes, which drop the lower half's, and those native code
+    /// completed (`x86_64::table_switch`).
     pub table_base_changes: u64,
+    pub native_table_switches: u64,
     /// Guest context changes at which the host isolated its branch
     /// predictions ([`PredictionContext`]).
     pub prediction_isolations: u64,
@@ -775,6 +797,33 @@ pub enum MailWait {
     LongestNative,
 }
 
+/// The guest PCs that issued the most TLBIs of everything, with their
+/// counts, most first, by space-saving: a PC not held takes the place of
+/// the least frequent and its count plus that one's, so a PC that issued
+/// more than a fifth of all is held, its count an upper bound. `[0, 0]` is
+/// free.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(
+    all(feature = "std", feature = "native-profile"),
+    derive(serde::Serialize)
+)]
+pub struct WholeTlbiSites(pub [[u64; 2]; 4]);
+
+impl WholeTlbiSites {
+    /// Count `count` TLBIs of everything at `pc`.
+    pub fn add(&mut self, pc: u64, count: u64) {
+        if count == 0 {
+            return;
+        }
+        if let Some(site) = self.0.iter_mut().find(|site| site[0] == pc && site[1] != 0) {
+            site[1] += count;
+        } else if let Some(least) = self.0.iter_mut().min_by_key(|site| site[1]) {
+            *least = [pc, least[1] + count];
+        }
+        self.0.sort_unstable_by(|a, b| b[1].cmp(&a[1]));
+    }
+}
+
 /// [`MailWait`]'s parts.
 pub const MAIL_WAITS: usize = MailWait::LongestNative as usize + 1;
 
@@ -807,8 +856,11 @@ impl core::ops::AddAssign for Statistics {
             itlb_misses,
             itlb_drops,
             itlb_sources,
+            whole_tlbi_sites,
+            whole_tlbi_times,
             compiled,
             self_loops,
+            regions,
             compile_ticks,
             stored,
             offered,
@@ -816,6 +868,8 @@ impl core::ops::AddAssign for Statistics {
             page_ticks,
             known_keys,
             known_absent,
+            awaited_pages,
+            awaited_lookups,
             offered_low,
             record_misses,
             shared_ticks,
@@ -827,6 +881,7 @@ impl core::ops::AddAssign for Statistics {
             native_transitions,
             engine_transitions,
             transition_misses,
+            switch_misses,
             branch_misses,
             line_queries,
             line_ticks,
@@ -850,6 +905,7 @@ impl core::ops::AddAssign for Statistics {
             tlb_maintenance,
             scoped_maintenance,
             table_base_changes,
+            native_table_switches,
             prediction_isolations,
             translated_pages,
             tagged_pages,
@@ -864,6 +920,7 @@ impl core::ops::AddAssign for Statistics {
             sync_ticks,
             mail_waits,
             store_sources,
+            ahead_installs,
         } = other;
         for (index, (total, count)) in self.mail_waits.iter_mut().zip(mail_waits).enumerate() {
             if index < MailWait::Longest as usize {
@@ -916,6 +973,9 @@ impl core::ops::AddAssign for Statistics {
         {
             *total += count;
         }
+        for (total, count) in self.switch_misses.iter_mut().zip(switch_misses) {
+            *total += count;
+        }
         for (total, count) in self
             .branch_misses
             .as_flattened_mut()
@@ -948,6 +1008,12 @@ impl core::ops::AddAssign for Statistics {
         for (total, count) in self.itlb_sources.iter_mut().zip(itlb_sources) {
             *total += count;
         }
+        for [pc, count] in whole_tlbi_sites.0 {
+            self.whole_tlbi_sites.add(pc, count);
+        }
+        for (total, count) in self.whole_tlbi_times.iter_mut().zip(whole_tlbi_times) {
+            *total += count;
+        }
         for (total, count) in self.record_misses.iter_mut().zip(record_misses) {
             *total += count;
         }
@@ -961,6 +1027,9 @@ impl core::ops::AddAssign for Statistics {
             .iter_mut()
             .zip(store_sources.as_flattened())
         {
+            *total += count;
+        }
+        for (total, count) in self.ahead_installs.iter_mut().zip(ahead_installs) {
             *total += count;
         }
         for (total, count) in [
@@ -978,6 +1047,7 @@ impl core::ops::AddAssign for Statistics {
             (&mut self.lookup_hits, lookup_hits),
             (&mut self.compiled, compiled),
             (&mut self.self_loops, self_loops),
+            (&mut self.regions, regions),
             (&mut self.compile_ticks, compile_ticks),
             (&mut self.stored, stored),
             (&mut self.offered, offered),
@@ -985,6 +1055,8 @@ impl core::ops::AddAssign for Statistics {
             (&mut self.page_ticks, page_ticks),
             (&mut self.known_keys, known_keys),
             (&mut self.known_absent, known_absent),
+            (&mut self.awaited_pages, awaited_pages),
+            (&mut self.awaited_lookups, awaited_lookups),
             (&mut self.offered_low, offered_low),
             (&mut self.shared_ticks, shared_ticks),
             (&mut self.install_ticks, install_ticks),
@@ -1009,6 +1081,7 @@ impl core::ops::AddAssign for Statistics {
             (&mut self.tlb_maintenance, tlb_maintenance),
             (&mut self.scoped_maintenance, scoped_maintenance),
             (&mut self.table_base_changes, table_base_changes),
+            (&mut self.native_table_switches, native_table_switches),
             (&mut self.prediction_isolations, prediction_isolations),
             (&mut self.translated_pages, translated_pages),
             (&mut self.tagged_pages, tagged_pages),
@@ -1142,6 +1215,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// The footprint from a finished walk: the parts its walk summed and the
     /// index and table sizes, which take the board's lock once.
     pub fn footprint_finish(&self, walk: &FootprintWalk) -> Footprint {
+        let index = self
+            .code
+            .every_page(super::board::LockSite::Report)
+            .heap_bytes();
         let cache = self.code.cache_at(super::board::LockSite::Report);
         Footprint {
             blocks: self.code.blocks.heap_bytes(),
@@ -1149,7 +1226,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             owners: 0,
             successors: walk.successors,
             rows: walk.rows,
-            index: cache.index.heap_bytes(),
+            index,
             lookup: cache.targets.index_bytes() + self.itlb.index_bytes(),
             pages: (self.pages.len() + self.spare_pages.len()) * crate::translations::PAGE_BYTES,
         }

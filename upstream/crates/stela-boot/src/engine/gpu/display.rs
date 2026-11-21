@@ -32,6 +32,9 @@ use core::{cell::UnsafeCell, ffi::c_int, ffi::c_void, ptr::NonNull};
 use stela_contracts::refuse;
 use stela_drivers::gpu::metal::kms::{self, Display, Drm, Error as DisplayError, Watched};
 use stela_soc::machine::{MonitorId, Scanout, ScanoutFormat, ScanoutMode};
+use stela_soc::scanout::{GpuPresent, GpuStats, Layer};
+
+mod composition;
 
 /// A GPU's primary node, the DRM master.
 struct Node(c_int);
@@ -101,6 +104,8 @@ struct KmsScanout {
     /// The counter at the display's last vertical blank as the last look
     /// read it, when it could ([`Display::last_vblank_ns`]).
     vblank_tsc: Option<u64>,
+    /// The display's frames its GPU composes.
+    composition: composition::Composition,
 }
 
 impl Scanout for KmsScanout {
@@ -122,12 +127,13 @@ impl Scanout for KmsScanout {
 
     fn present(&mut self, rows: &[u8]) -> Result<()> {
         self.presented = true;
-        let Some((_, display)) = &mut self.display else {
+        let Some((name, display)) = &mut self.display else {
             // Shown nowhere: a display taken later asks every row of the
             // next frame, its buffers holding none.
             self.look();
             return Ok(());
         };
+        self.composition.settle(name, self.tsc_hz);
         console::release();
         let presented = display.present(rows);
         self.blank &= presented.is_err();
@@ -142,16 +148,45 @@ impl Scanout for KmsScanout {
         fill: &mut dyn FnMut(usize, &mut [u8]) -> Result<()>,
     ) -> Result<bool> {
         self.presented = true;
-        let Some((_, display)) = &mut self.display else {
+        let Some((name, display)) = &mut self.display else {
             self.look();
             return Ok(true);
         };
+        self.composition.settle(name, self.tsc_hz);
         let prepared = display.prepare_rows(damage, fill)?;
         console::release();
         let presented = prepared.present();
         self.blank &= presented.is_err();
         finish_present(display, presented)?;
         Ok(true)
+    }
+
+    /// The display's GPU composes the frame into the hidden buffer, which
+    /// flips once the composition completed ([`composition`]).
+    fn try_present_gpu(
+        &mut self,
+        layers: &[Layer],
+        damage: Option<Range<usize>>,
+        physical: &dyn Fn(u64) -> Option<u64>,
+    ) -> Result<GpuPresent> {
+        let Some((name, display)) = &mut self.display else {
+            return Ok(GpuPresent::Declined(
+                "no GPU display shows the guest's frames",
+            ));
+        };
+        let offered = self
+            .composition
+            .offer(name, display, layers, damage, physical, self.tsc_hz);
+        if offered == GpuPresent::Taken {
+            self.presented = true;
+            self.blank = false;
+            console::release();
+        }
+        Ok(offered)
+    }
+
+    fn take_gpu_stats(&mut self) -> GpuStats {
+        self.composition.take_stats()
     }
 
     fn refresh_rates(&self) -> Vec<u32> {
@@ -194,10 +229,12 @@ impl Scanout for KmsScanout {
                 .display
                 .as_ref()
                 .is_some_and(|(_, display)| display.queued())
+            || self.composition.pending()
     }
 
     fn flush(&mut self) -> Result<()> {
-        if let Some((_, display)) = &mut self.display {
+        if let Some((name, display)) = &mut self.display {
+            self.composition.flush(name, display, self.tsc_hz);
             let flushed = display.flush();
             finish_present(display, flushed)?;
         }
@@ -248,6 +285,7 @@ impl KmsScanout {
             tsc_hz,
             reported: false,
             vblank_tsc: None,
+            composition: composition::Composition::default(),
         }
     }
 

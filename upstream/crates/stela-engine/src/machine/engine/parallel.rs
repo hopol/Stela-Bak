@@ -527,6 +527,9 @@ pub struct Counts {
     /// Its installs at EL0 and above by where the block came from
     /// ([`super::Statistics::store_sources`]).
     pub store_sources: [[u64; 5]; 2],
+    /// Of its shared installs, blocks prepared ahead of any fetch
+    /// ([`super::Statistics::ahead_installs`]).
+    pub ahead_installs: [u64; 2],
     /// Blocks it holds, the slots its block table has, the pages its
     /// index finds blocks in, and the parts of its code arena it released
     /// for heap pressure.
@@ -596,10 +599,18 @@ pub struct Counts {
     /// Why SVC, ERET, GENTER and GEXIT took the engine path, in kind order
     /// ([`super::Statistics::transition_misses`]).
     pub transition_misses: [[u64; super::transitions::miss::REASONS]; 4],
+    /// Why its TTBR0 changes took the engine path
+    /// ([`super::Statistics::switch_misses`]).
+    pub switch_misses: [u64; super::table_switches::miss::REASONS],
     /// Why its runs ended at branch-kind exits, in kind order
     /// ([`super::Statistics::branch_misses`]).
     pub branch_misses: [[u64; super::reports::BRANCH_REASONS]; super::reports::BRANCH_KINDS],
     pub itlb_sources: [u64; super::ItlbSource::COUNT],
+    /// The guest PCs of its own TLBIs of everything
+    /// ([`super::Statistics::whole_tlbi_sites`]).
+    pub whole_tlbi_sites: super::WholeTlbiSites,
+    /// ([`super::Statistics::whole_tlbi_times`]).
+    pub whole_tlbi_times: [u64; 3],
     /// Its stamped transfers ([`chain::StampCount`]'s order), the exits it
     /// gave a stamped tail, how many exits had one when it last looked, then
     /// the PAC branch exits it gave a predicted tail and its probe
@@ -1251,7 +1262,7 @@ impl Hub {
     /// there to note them ([`Self::compiling`]): an IC IVAU of one must
     /// reach every PE that may run them.
     pub(super) fn note_code(&self, code: &super::board::Code) {
-        for frame in code.cache_at(super::board::LockSite::Other).index.frames() {
+        for frame in code.every_page(super::board::LockSite::Other).frames() {
             self.compiling(frame);
         }
     }
@@ -2346,33 +2357,43 @@ impl<H: Host, D: Devices> Machine<H, D> {
             if until > start.saturating_add(self.idle_poll) {
                 return None;
             }
-            loop {
-                let hub = self.parallel.as_ref()?;
+            // The spin is idle time, as the passes' halt-poll is.
+            self.profile_idle(true);
+            let ended = 'spin: loop {
+                let Some(hub) = self.parallel.as_ref() else {
+                    break 'spin Some(None);
+                };
                 if hub.woken(pe, self.lines_epoch) {
                     if let Err(stop) = self.read_mail() {
-                        return Some(Err(stop));
+                        break 'spin Some(Some(Err(stop)));
                     }
                     let now = self.now();
-                    let hub = self.parallel.as_ref()?;
+                    let Some(hub) = self.parallel.as_ref() else {
+                        break 'spin Some(None);
+                    };
                     if hub.woken(pe, self.lines_epoch) || !self.ready(pe, now) {
                         self.statistics.sleep_ticks += self.host.counter().wrapping_sub(start);
-                        return None;
+                        break 'spin Some(None);
                     }
-                    break;
+                    break 'spin None;
                 }
                 if self.host.poll_interrupt() {
                     self.statistics.sleep_ticks += self.host.counter().wrapping_sub(start);
-                    return None;
+                    break 'spin Some(None);
                 }
                 if self.host.counter() >= until {
                     let now = self.now();
                     if !self.ready(pe, now) {
                         self.statistics.sleep_ticks += self.host.counter().wrapping_sub(start);
-                        return None;
+                        break 'spin Some(None);
                     }
-                    break;
+                    break 'spin None;
                 }
                 self.host.relax();
+            };
+            self.profile_idle(false);
+            if let Some(ended) = ended {
+                return ended;
             }
         }
         self.statistics.waits += 1;
@@ -2461,6 +2482,21 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if translating.load(Ordering::Relaxed) != word {
             translating.store(word, Ordering::SeqCst);
         }
+    }
+
+    /// Where native code publishes this PE's translating word and finds
+    /// its mail pending (`x86_64::table_switch::Table`), and the word a
+    /// regime's controls `controls` publish; zeros without a hub.
+    pub(super) fn switch_words(&self, controls: &mmu::Controls) -> (u64, u64, u64) {
+        let Some(hub) = &self.parallel else {
+            return (0, 0, 0);
+        };
+        let inbox = &hub.inboxes[self.current];
+        (
+            inbox.translating.as_ptr() as u64,
+            inbox.pending.as_ptr() as u64,
+            u64::from(context_word(controls.regime, mmu::current_asid(controls))),
+        )
     }
 
     /// See [`GlobalSpan::widen`]: whether the leaf holding `address` widened
@@ -2651,6 +2687,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 [statistics.self_loops, entries, iterated]
             },
             store_sources: statistics.store_sources,
+            ahead_installs: statistics.ahead_installs,
             live_blocks: self.code.blocks.live() as u64,
             block_slots: self.code.blocks.len() as u64,
             indexed_pages: self.code.indexed_pages() as u64,
@@ -2686,6 +2723,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             itlb_drops: statistics.itlb_drops,
             lookup_forgets: statistics.lookup_forgets,
             itlb_sources: statistics.itlb_sources,
+            whole_tlbi_sites: statistics.whole_tlbi_sites,
+            whole_tlbi_times: statistics.whole_tlbi_times,
             transitions: [
                 statistics.native_transitions[stela_compiler::x86_64::transition::GUARDED_ENTER],
                 statistics.engine_transitions[stela_compiler::x86_64::transition::GUARDED_ENTER],
@@ -2697,6 +2736,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 statistics.engine_transitions[stela_compiler::x86_64::transition::EXCEPTION_RETURN],
             ],
             transition_misses: statistics.transition_misses,
+            switch_misses: statistics.switch_misses,
             branch_misses: statistics.branch_misses,
             stamped: {
                 let mut stamped = [0; chain::STAMP_COUNTS + 11];

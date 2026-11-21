@@ -27,6 +27,9 @@ pub(super) struct EngineImage {
 /// Firmware-owned allocations kept by the engine and its native workers.
 pub(super) struct EngineMemory {
     pub heap: Region,
+    /// The heap bytes for compiled code beside the window
+    /// (`host_memory::Sizes::kept`).
+    pub kept_code: u64,
     pub native_resources: NativeResources,
     pub native_task_allocations: crate::native_smp::resources::TaskAllocations,
     pub stack: Region,
@@ -131,12 +134,17 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
         },
     };
     let free = free_ram()?;
-    let sizes = stela_boot_core::host_memory::sizes(free, cores, cores)?;
+    // A pack read on demand left part of its budget free: the window and
+    // the guest share it.
+    let room = crate::engine::translations::PACK_ROOM.load(core::sync::atomic::Ordering::Acquire);
+    let sizes = stela_boot_core::host_memory::sizes_with_room(free, cores, cores, room)?;
     output::arguments(format_args!(
-        "HOST MEMORY free={}M heap={}M code={}M pool={}M guest={}M\n",
+        "HOST MEMORY free={}M heap={}M code={}M window={}M kept={}M pool={}M guest={}M\n",
         free >> 20,
         sizes.heap >> 20,
         sizes.code.bytes >> 20,
+        sizes.code.window >> 20,
+        sizes.kept >> 20,
         sizes.pool >> 20,
         sizes.guest >> 20,
     ));
@@ -202,6 +210,7 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
     let root = loader_tables.root();
     Ok(EngineMemory {
         heap,
+        kept_code: sizes.kept,
         native_resources,
         native_task_allocations,
         stack,
@@ -254,7 +263,7 @@ fn boot_services_sipi_page() -> Option<u64> {
 pub(super) fn map(
     image: &EngineImage,
     memory: &mut EngineMemory,
-    runtime: &Runtime,
+    runtime: &mut Runtime,
     storage: Option<&stela_drivers::Handoff>,
     native_mmio: Option<&mut crate::native_mmio::Prepared>,
     host_firmware: &crate::host_firmware::Resources,

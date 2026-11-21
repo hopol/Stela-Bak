@@ -89,6 +89,8 @@ use core::{
 use stela_contracts::gate::{BundleReport, CallerFault, CallerMemory, GateService, MemoryRange};
 use stela_crypto::{Sha256, digest::Digest};
 
+mod display;
+pub use display::DisplayTarget;
 mod read_back;
 use read_back::{ReadBacks, Step};
 
@@ -1483,6 +1485,38 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
         {
             self.publish(value);
         }
+    }
+
+    /// Whether command buffer `serial` of the device of generation `epoch`
+    /// completed: from the published completion when it shows, else from a
+    /// turn's poll unless a call holds the service. `None` once its device
+    /// was lost or replaced.
+    fn serial_done(&self, epoch: u64, serial: u64) -> Option<bool> {
+        let generation = &self.read_backs.generation;
+        if generation.current() != epoch {
+            return None;
+        }
+        self.publish_marker();
+        let reached = self.reached.load(Ordering::Acquire);
+        if reached != POLL_UNAVAILABLE && reached >= serial {
+            return Some(true);
+        }
+        // A waiter publishes it, with no driver query here.
+        if reached != POLL_UNAVAILABLE && self.publishable.load(Ordering::Acquire) {
+            return Some(false);
+        }
+        let Some(mut turn) = self.try_turn() else {
+            return Some(false);
+        };
+        if generation.current() != epoch {
+            return None;
+        }
+        let mut done = Ok(false);
+        (self.host.run)(self.host.stack, &mut || {
+            done = turn.device().completes(serial);
+        });
+        drop(turn);
+        done.ok()
     }
 
     /// Submissions seen complete since the last call, the ticks from their

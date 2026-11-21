@@ -17,7 +17,7 @@ use reports::*;
 pub use reports::{
     DeviceRegister, Discard, Event, ExitWordsWalk, Footprint, FootprintWalk, MAIL_WAITS, MailWait,
     Occupancy, PeState, Requirement, RequirementKind, Reset, Statistics, Stop, Surveyed,
-    Suspension, TRACE_HITS, TraceHit, WATCH_HITS, WatchHit,
+    Suspension, TRACE_HITS, TraceHit, WATCH_HITS, WatchHit, WholeTlbiSites,
 };
 mod amx;
 mod apple_maintenance;
@@ -57,6 +57,7 @@ mod pointer_authentication;
 mod regime_state;
 mod scheduler;
 mod system_access;
+mod table_switches;
 mod timing;
 mod transitions;
 pub use board::{CodeReport, LockCounts, LockSite, SiteCounts};
@@ -70,6 +71,8 @@ pub use parallel::{
     SourceObservation, SourcePhase,
 };
 pub use rebase::RebaseCounts;
+/// The reasons [`Statistics::switch_misses`] counts.
+pub const SWITCH_MISS_REASONS: usize = table_switches::miss::REASONS;
 pub use stela_contracts::dma::{DmaError, TransferFault};
 mod pointer;
 mod prepare;
@@ -78,11 +81,13 @@ pub use device_read::{CanonicalDeviceMemory, ConsumedScalar, DeviceReadRequest, 
 pub use device_write::{
     CanonicalDeviceWrite, CanonicalWriteMemory, ConsumedWrite, DeviceWriteRequest, DeviceWriteShape,
 };
+pub mod ahead;
 mod block_index;
 mod board;
 mod page_sets;
 mod processors;
 mod recovery;
+pub mod refill;
 mod scalable;
 mod shared_memory;
 pub mod step_timing;
@@ -107,8 +112,6 @@ use alloc::{
 use core::fmt;
 use core::mem::offset_of;
 use core::num::NonZeroU64;
-#[cfg(test)]
-use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering;
 use pointer::{PointerInputs, PointerOperation, PointerResult, SERVICE, TAGS, strip_place};
 #[cfg(test)]
@@ -155,13 +158,15 @@ use stela_compiler::{
     },
     x86_64::{
         MemoryChecks, NativeSystem, cache_clean, chain, native_exclusive,
-        pointer as x86_64_pointer, register_read, transition, zero_block,
+        pointer as x86_64_pointer, register_read, table_switch, transition, zero_block,
     },
 };
 pub use stela_contracts::bus::Transition;
 pub use stela_contracts::dma::Memory;
 pub use stela_contracts::gate::{CallerFault, CallerMemory, GateCall, GateOutcome};
-pub use stored::{EntryChecks, Offer, SharedTranslation, StoreEvent, Translations, entry_checks};
+pub use stored::{
+    EntryChecks, Looked, Offer, SharedTranslation, StoreEvent, Translations, entry_checks,
+};
 pub use system::FP_TRAPS_WRITABLE;
 use {
     super::cpu::Cpu, super::cpu::Exception, super::cpu::HCR_AMO, super::cpu::HCR_API,
@@ -779,6 +784,9 @@ pub struct Machine<H: Host, D: Devices> {
     /// System exits by key since they were last taken, under step timing
     /// ([`Self::take_system_exits`]).
     system_exits: Box<step_timing::SystemExits>,
+    /// The System exit whose round trip is being traced, under step timing
+    /// ([`step_timing::ExitTrace`]).
+    exit_trace: step_timing::ExitTrace,
     /// Hot-block samples not yet taken, under step timing
     /// ([`step_timing::HotBlocks`], [`Self::take_hot_samples`]), the runs
     /// until the next sampled one and the generator of sampled budgets.
@@ -986,6 +994,13 @@ pub struct Machine<H: Host, D: Devices> {
     /// iterations inside themselves (`NativeSystem::self_loops`): on, but
     /// for tests that compare both forms.
     self_loops: bool,
+    /// The [`Self::event_sample`] the event stream native WFEs sample
+    /// was published for ([`Self::enter_events`]); `None` once the
+    /// streams' controls may have changed.
+    stream_sample: Option<u64>,
+    /// Whether blocks run on past their branches into regions that hold a
+    /// loop (`NativeSystem::regions`): on, but for tests that compare both.
+    regions: bool,
     /// The physical count up to which the event streams have set the event
     /// register; `None` before the first sample.
     event_sample: Option<u64>,
@@ -1065,6 +1080,9 @@ pub struct Machine<H: Host, D: Devices> {
     /// its own after ([`Self::remember_target`]); none outside such a
     /// fetch.
     publishing_target: Option<u64>,
+    /// The PC whose fetch linked the direct exit waiting for it in its
+    /// install's hold, for that fetch's [`Self::remember_or_link`].
+    linked_at_install: Option<u64>,
     /// Maintenance for the other PEs that this PE's next DSB sends
     /// ([`Self::send_outgoing`]).
     outgoing: Vec<parallel::Maintenance>,
@@ -1114,6 +1132,12 @@ pub struct Machine<H: Host, D: Devices> {
     /// The instruction just completed wrote PSTATE.PACM (PACM, or an
     /// exception return), so it does not lapse.
     pacm_written: bool,
+    /// The System exit just completed left everything the run loop's
+    /// schedule and device step look at as the last full step found it, so
+    /// the loop fetches at once ([`Self::continues_directly`]).
+    direct_next: bool,
+    /// The run loop's fetches at once since its last full step.
+    direct_runs: u32,
     /// The engine-path transition whose record the next native entry at
     /// its target makes (`transitions`).
     transition_note: Option<transitions::Note>,
@@ -1316,9 +1340,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
             host.code_partitions()
                 .map(|parts| parts.bytes_per_part * parts.parts)
         });
-        let (table_entries, itlb_entries) = code_bytes
-            .map_or((chain::LOOKUP_ENTRIES, chain::ITLB_ENTRIES), |bytes| {
-                (chain::lookup_entries(bytes), chain::itlb_entries(bytes))
+        let (table_entries, itlb_entries) =
+            code_bytes.map_or((chain::LOOKUP_ENTRIES, chain::ITLB_ENTRIES), |bytes| {
+                (
+                    chain::first_lookup_entries(bytes),
+                    chain::itlb_entries(bytes),
+                )
             });
         // The hub's code when this host gives its window, else a board of
         // one PE until the machine joins a hub's.
@@ -1355,6 +1382,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             timed_word: None,
             timed_closed: false,
             system_exits: Box::default(),
+            exit_trace: step_timing::ExitTrace::default(),
             hot_samples: Vec::new(),
             dynamic_samples: Vec::new(),
             promotion_runs: 0,
@@ -1439,7 +1467,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             memory_checks: None,
             native_system: None,
             self_loops: true,
+            regions: true,
             event_sample: None,
+            stream_sample: None,
             debug: None,
             device_lines: None,
             device_generation: None,
@@ -1465,6 +1495,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             mail_spare: Vec::new(),
             direct_exit: None,
             publishing_target: None,
+            linked_at_install: None,
             outgoing: Vec::new(),
             lines_epoch: 0,
             serving_since: None,
@@ -1487,6 +1518,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             wait_limit: None,
             waited: 0,
             pacm_written: false,
+            direct_next: false,
+            direct_runs: 0,
             transition_note: None,
             completing: None,
             chain: chain_control::Owner::default(),
@@ -1558,5 +1591,7 @@ impl<H: Host> mmu::TableMemory for RamTables<'_, H> {
 
 #[cfg(test)]
 mod density;
+#[cfg(test)]
+mod fetch_costs;
 #[cfg(test)]
 mod tests;

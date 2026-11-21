@@ -81,11 +81,15 @@
  * the view, then for the two-plane extended-range encodings the address of
  * the alpha plane's first texel, or zero, its bytes per row, and the
  * pass's stamp (STELA_METAL_DIRTY_LAYER: nonzero, the region is the whole
- * image from its origin and thread n converts texel n % 64 of row
- * n / 64 % 64 of tile n / 4096 where the dirty layer holds the stamp), and the
+ * image from its origin and thread n converts column n % 64 of tile n / 64,
+ * row after row, where the dirty layer holds the stamp), and the
  * planes' mirror (STELA_METAL_TEXELS_MIRROR_*): the view's next layer
  * holds, per texel, the codes word and alpha byte the planes hold, which a
- * load compares to write only the texels that changed. */
+ * load compares to write only the texels that changed. Last, the planes'
+ * device copy, which a load writes with the planes, the same texels: the
+ * address of the region's first codes word, or zero for none, its bytes
+ * per row, its alpha plane's bytes per row and the address of the region's
+ * first alpha byte, or zero. */
 #define STELA_METAL_TEXELS_BUFFER 0u
 #define STELA_METAL_TEXELS_COUNT 8u
 #define STELA_METAL_TEXELS_ENCODING 12u
@@ -99,15 +103,23 @@
 #define STELA_METAL_TEXELS_ALPHA 56u
 #define STELA_METAL_TEXELS_ALPHA_ROW 64u
 #define STELA_METAL_TEXELS_MIRROR 68u
-#define STELA_METAL_TEXELS_BYTES 72u
+#define STELA_METAL_TEXELS_COPY 72u
+#define STELA_METAL_TEXELS_COPY_ROW 80u
+#define STELA_METAL_TEXELS_COPY_ALPHA_ROW 84u
+#define STELA_METAL_TEXELS_COPY_ALPHA 88u
+#define STELA_METAL_TEXELS_BYTES 96u
 
 /* What the two-plane encodings do with the planes' mirror
  * (STELA_METAL_TEXELS_MIRROR): nothing; every conversion writes it; or as
  * WRITE, and a load writes the planes only where the codes or alpha differ
- * from the mirror's, which holds what the planes do. */
+ * from the mirror's, which holds what the planes do. With COPY, the planes'
+ * device copy (STELA_METAL_TEXELS_COPY) holds what they do in its place:
+ * a load writes the planes and the copy only where the codes or alpha
+ * differ from the copy's, and nothing writes the mirror. */
 #define STELA_METAL_TEXELS_MIRROR_NONE 0u
 #define STELA_METAL_TEXELS_MIRROR_WRITE 1u
 #define STELA_METAL_TEXELS_MIRROR_COMPARE 2u
+#define STELA_METAL_TEXELS_MIRROR_COPY 3u
 
 /* The layouts a texture's image stores in place of its Metal format's
  * bytes (pixel_format.rs Encoding): the extended-range codes of BGR10_XR
@@ -586,6 +598,56 @@ nir_shader *stela_metal_load_texels_kernel(const nir_shader_compiler_options *op
  * along rows, then rows, then layers: the mean of its samples' values,
  * decoded and encoded by the format, as Metal's resolve stores. */
 nir_shader *stela_metal_average_samples_kernel(const nir_shader_compiler_options *options);
+
+/* ComposeArguments (scanout_compose.rs): the display's composition of up to
+ * STELA_METAL_COMPOSE_MAX_LAYERS layers into a frame of 8-bit BGRX pixels,
+ * as the display coprocessor's model composes on the CPU. Thread n writes
+ * pixel n % width of row first_row + n / width: the black background, then
+ * each layer whose destination rectangle holds the pixel, bottom first,
+ * blended source-over. A layer's pixel is its source pixel under the
+ * destination pixel's centre (nearest neighbour); its color is taken as
+ * premultiplied by its alpha, or multiplied by it first. Each channel is
+ * rounded as (value * weight + 127) / 255 and saturates at 255. */
+#define STELA_METAL_COMPOSE_DESTINATION 0u
+#define STELA_METAL_COMPOSE_PITCH 8u
+#define STELA_METAL_COMPOSE_WIDTH 12u
+#define STELA_METAL_COMPOSE_FIRST_ROW 16u
+#define STELA_METAL_COMPOSE_COUNT 20u
+#define STELA_METAL_COMPOSE_LAYER_COUNT 24u
+#define STELA_METAL_COMPOSE_LAYERS 32u
+#define STELA_METAL_COMPOSE_MAX_LAYERS 4u
+/* Each layer: the address of its color plane's first pixel and of its
+ * alpha plane's (two-plane extended range only), their bytes per row, its
+ * format (enum stela_metal_compose_format), its flags, then its source and
+ * destination rectangles as x, y, width and height. */
+#define STELA_METAL_COMPOSE_LAYER_COLOR 0u
+#define STELA_METAL_COMPOSE_LAYER_ALPHA 8u
+#define STELA_METAL_COMPOSE_LAYER_STRIDE 16u
+#define STELA_METAL_COMPOSE_LAYER_ALPHA_STRIDE 20u
+#define STELA_METAL_COMPOSE_LAYER_FORMAT 24u
+#define STELA_METAL_COMPOSE_LAYER_FLAGS 28u
+#define STELA_METAL_COMPOSE_LAYER_SOURCE 32u
+#define STELA_METAL_COMPOSE_LAYER_DESTINATION 48u
+#define STELA_METAL_COMPOSE_LAYER_BYTES 64u
+#define STELA_METAL_COMPOSE_BYTES                                                                \
+   (STELA_METAL_COMPOSE_LAYERS + STELA_METAL_COMPOSE_MAX_LAYERS * STELA_METAL_COMPOSE_LAYER_BYTES)
+#define STELA_METAL_COMPOSE_PREMULTIPLIED 1u
+
+enum stela_metal_compose_format {
+   /* 8:8:8:8, blue in the low byte. */
+   STELA_METAL_COMPOSE_BGRA8,
+   /* 8:8:8:8, red in the low byte. */
+   STELA_METAL_COMPOSE_RGBA8,
+   /* 2:10:10:10, blue in the low bits; each component rescaled to 8 bits
+    * rounded, alpha's two bits times 85. */
+   STELA_METAL_COMPOSE_ARGB2101010,
+   /* RGB10A8_2P_XR10: extended-range codes, each shown as its value
+    * (code - 384) / 510 clamped to [0, 1] in 8 bits, rounded half up, and
+    * 8-bit alpha in the second plane. */
+   STELA_METAL_COMPOSE_XR10A8,
+};
+
+nir_shader *stela_metal_compose_kernel(const nir_shader_compiler_options *options);
 
 /* Thread n decodes texel n of the TexelArguments' region, counted along
  * rows, then rows, then images, from the buffer's ETC2 or EAC blocks into

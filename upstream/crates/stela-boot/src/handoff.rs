@@ -32,6 +32,10 @@ pub struct Handoff {
     pub files: [File; MAX_FILES],
     pub file_count: usize,
     pub heap: Region,
+    /// The heap bytes for compiled code beside the code window: blocks the
+    /// PEs share as they compile and stored forms of blocks the window let
+    /// go (`host_memory::Sizes::kept`).
+    pub kept_code: u64,
     pub stack: Region,
     pub code: Region,
     /// Page-table frames: engine roots and shadow tables.
@@ -127,6 +131,9 @@ pub struct Handoff {
     /// in the USB's log: what a stop the log cannot keep leaves its record
     /// with (`stop_record`).
     pub(crate) stop_record: crate::stop_record::Services,
+    /// The firmware's runtime regions and how the loader's root reaches
+    /// each, for the line of a fault inside a firmware call.
+    pub(crate) runtime_regions: stela_boot_core::firmware_runtime::Regions,
     /// Whether the loader found a UART at COM1 (`serial::present`). The
     /// engine runs a copy of this image taken before any Rust state
     /// existed, so it learns the result here, not from its own statics.

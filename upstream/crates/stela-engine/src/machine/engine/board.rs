@@ -19,12 +19,21 @@
 //!   gives its whole code window, the one [`Arena`] of a board's machines,
 //!   or of one machine alone.
 //!
+//! Its locks, each counted by site ([`LockCounts`]): a [`Shard`] of the
+//! block index per group of pages ([`block_index::shard_of`]), which an
+//! install, a link, a page's retirement step and an IC IVAU take for the
+//! page they change; and the block table's ([`Cache`]), which the block
+//! table, its cells and the lookup dispatchers change under. A holder of a
+//! shard may take the table's lock, the part lists' ([`Code::code_slots`])
+//! or the census's inside it; never a shard inside any of those, nor two
+//! shards but in shard order (a discard of every block).
+//!
 //! The grace is entered and left with the hub's run-loop flags and passed
 //! once per run-loop iteration.
 
 use super::{
     Block, CodePartitions, CodeWindow, Padded, VariantId,
-    block_index::{BlockIndex, Finder},
+    block_index::{BlockIndex, Finder, SHARDS},
     code_slots::CodeSlots,
     recovery::CodeRecovery,
 };
@@ -32,10 +41,12 @@ use crate::platform::sync::{Mutex, MutexGuard};
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{
-    AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
 };
 use stela_compiler::x86_64::chain::{self, LookupTable, TableReader};
 
+#[cfg(test)]
+mod replay;
 mod ring;
 #[cfg(test)]
 mod tests;
@@ -163,8 +174,17 @@ pub(super) struct Board {
 pub(super) struct Code {
     /// The blocks, which any PE reads without a lock.
     pub(super) blocks: Blocks,
-    /// What changes with installs, links and evictions, under one lock.
-    pub(super) cache: Mutex<Cache>,
+    /// The block table, its cells and the dispatchers, under one lock.
+    pub(super) cache: CodeLock<Cache>,
+    /// The block index, by shard of pages, each under its own lock.
+    pub(super) shards: Box<[CodeLock<Shard>]>,
+    /// The blocks of each arena part, which a retirement lists; an install
+    /// adds its block, while its part is live, under this lock inside its
+    /// shard's ([`Ring::live`]).
+    pub(super) code_slots: Mutex<CodeSlots>,
+    /// Why blocks were installed on a shared board, with `--profile`: one
+    /// census for the board, as its blocks are.
+    pub(super) census: Mutex<Option<Box<super::install_census::Census>>>,
     /// The block table's entries, for reads without the lock.
     pub(super) table: TableReader,
     /// The block index's blocks, for reads without the lock.
@@ -187,10 +207,6 @@ pub(super) struct Code {
     /// Units of work a retirement step takes under the lock
     /// ([`super::code_cache::STEP_VISITS`]; tests take fewer).
     pub(super) step_visits: u64,
-    /// PEs waiting for the lock now ([`Self::cache_at`]): a retirement
-    /// step ends early while one does ([`Self::wanted`]). On a line of its
-    /// own, as only waiters write it.
-    pub(super) waiting: Padded<AtomicU32>,
     /// The fetch pages its PEs compile in the tagged variant.
     pub(super) tagged: super::page_sets::PageSet,
     /// The fetch pages its PEs compile with the two-sided range check at
@@ -350,18 +366,12 @@ impl Arena {
     }
 }
 
-/// What a board's code changes under its lock: the block index (whose
-/// [`Finder`] fetches read without it), the block table (whose entries
-/// native probes read without it) and the blocks of each arena part. A
-/// block's fault recovery is its record's ([`Record::recovery`]).
+/// What a board's code changes under the block table's lock: the block
+/// table (whose entries native probes read without it), its cells and the
+/// lookup dispatchers. A block's fault recovery is its record's
+/// ([`Record::recovery`]).
 pub(super) struct Cache {
-    pub(super) index: BlockIndex,
     pub(super) targets: LookupTable,
-    pub(super) code_slots: CodeSlots,
-    /// The blocks of a page being detached, kept for its capacity.
-    pub(super) page_blocks: Vec<usize>,
-    /// A bit per block slot for what a detach detaches.
-    pub(super) marked: Vec<u64>,
     /// The lookup dispatchers in each arena part that has them, by ring
     /// generation and BTYPE: a tail calls the probes of its own part.
     pub(super) dispatchers: Vec<(u32, [Option<u64>; 4])>,
@@ -371,12 +381,124 @@ pub(super) struct Cache {
     /// ([`TargetCounts`]).
     pub(super) targets_inserted: u64,
     pub(super) targets_raced: u64,
-    /// Why blocks were installed on a shared board, with `--profile`:
-    /// one census for the board, as its blocks are.
-    pub(super) census: Option<Box<super::install_census::Census>>,
+    /// When the block table's last growth published its successor, while
+    /// the table it replaced is held: it goes once that grace passed
+    /// ([`super::compilation::grow_table`]).
+    pub(super) table_retired: Option<Snapshot>,
+}
+
+/// What a shard of a board's pages ([`super::block_index::shard_of`])
+/// changes under its lock: their part of the block index, whose [`Finder`]
+/// fetches read without it, and what installs and retirements of their
+/// blocks count.
+pub(super) struct Shard {
+    pub(super) index: BlockIndex,
+    /// The blocks of a page being detached, kept for its capacity.
+    pub(super) page_blocks: Vec<usize>,
+    /// A bit per block slot for what a detach detaches.
+    pub(super) marked: Vec<u64>,
     /// Why blocks the board held before are installed again
     /// ([`super::churn`]).
     pub(super) churn: super::ChurnCounts,
+    pub(super) lock: LockCounts,
+}
+
+impl Shard {
+    fn new(finder: Arc<Finder>) -> Self {
+        Self {
+            index: BlockIndex::with_finder(finder),
+            page_blocks: Vec::new(),
+            marked: Vec::new(),
+            churn: super::ChurnCounts::default(),
+            lock: LockCounts::default(),
+        }
+    }
+}
+
+/// What a [`CodeLock`] holds: its counts.
+pub(super) trait Counted {
+    fn counts(&mut self) -> &mut LockCounts;
+}
+
+impl Counted for Cache {
+    fn counts(&mut self) -> &mut LockCounts {
+        &mut self.lock
+    }
+}
+
+impl Counted for Shard {
+    fn counts(&mut self) -> &mut LockCounts {
+        &mut self.lock
+    }
+}
+
+/// One of a board's code locks, counted by site, on lines of its own.
+#[repr(align(64))]
+pub(super) struct CodeLock<T> {
+    value: Mutex<T>,
+    /// PEs waiting for it now ([`Self::at`]): a retirement step under it
+    /// ends early while one does ([`Self::wanted`]). Only waiters write it.
+    waiting: Padded<AtomicU32>,
+}
+
+impl<T: Counted> CodeLock<T> {
+    fn new(value: T) -> Self {
+        Self {
+            value: Mutex::new(value),
+            waiting: Padded(AtomicU32::new(0)),
+        }
+    }
+
+    /// The lock, counted ([`LockCounts`]) for `site`.
+    pub(super) fn at(&self, site: LockSite) -> CacheGuard<'_, T> {
+        let site = site as usize;
+        if let Ok(mut held) = self.value.try_lock() {
+            let lock = held.counts();
+            lock.acquired += 1;
+            lock.sites[site].acquired += 1;
+            return CacheGuard {
+                guard: held,
+                site,
+                since: timestamp(),
+            };
+        }
+        let start = timestamp();
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        let mut held = self.value.lock().unwrap_or_else(|error| error.into_inner());
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
+        let since = timestamp();
+        let waited = since.wrapping_sub(start);
+        let lock = held.counts();
+        lock.acquired += 1;
+        lock.contended += 1;
+        lock.waited += waited;
+        lock.longest = lock.longest.max(waited);
+        lock.sites[site].acquired += 1;
+        lock.sites[site].waited += waited;
+        CacheGuard {
+            guard: held,
+            site,
+            since,
+        }
+    }
+
+    /// Whether a PE waits for the lock now: a holder doing work that can
+    /// stop at any of its bounds (a retirement step) lets it in first.
+    pub(super) fn wanted(&self) -> bool {
+        self.waiting.load(Ordering::Relaxed) != 0
+    }
+
+    /// Say that `waiting` PEs wait for it, as a test's stand-in for them.
+    #[cfg(test)]
+    pub(super) fn set_waiting(&self, waiting: u32) {
+        self.waiting.store(waiting, Ordering::Relaxed);
+    }
+
+    /// The lock taken without counting the take: for the reports that
+    /// read and restart the counts of every lock.
+    fn uncounted(&self) -> MutexGuard<'_, T> {
+        self.value.lock().unwrap_or_else(|error| error.into_inner())
+    }
 }
 
 /// How a board's code lock was taken, counted under it: no atomic beyond
@@ -458,30 +580,34 @@ impl LockSite {
     }
 }
 
-/// The board's code lock held, charging its hold to its [`LockSite`].
-pub(super) struct CacheGuard<'a> {
-    guard: MutexGuard<'a, Cache>,
+/// One of the board's code locks held, charging its hold to its
+/// [`LockSite`].
+pub(super) struct CacheGuard<'a, T: Counted = Cache> {
+    guard: MutexGuard<'a, T>,
     site: usize,
     since: u64,
 }
 
-impl core::ops::Deref for CacheGuard<'_> {
-    type Target = Cache;
-    fn deref(&self) -> &Cache {
+/// A shard of the block index held ([`Code::page_at`]).
+pub(super) type PageGuard<'a> = CacheGuard<'a, Shard>;
+
+impl<T: Counted> core::ops::Deref for CacheGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
         &self.guard
     }
 }
 
-impl core::ops::DerefMut for CacheGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Cache {
+impl<T: Counted> core::ops::DerefMut for CacheGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
         &mut self.guard
     }
 }
 
-impl Drop for CacheGuard<'_> {
+impl<T: Counted> Drop for CacheGuard<'_, T> {
     fn drop(&mut self) {
         let held = timestamp().wrapping_sub(self.since);
-        let site = &mut self.guard.lock.sites[self.site];
+        let site = &mut self.guard.counts().sites[self.site];
         site.held += held;
         site.longest_held = site.longest_held.max(held);
     }
@@ -542,6 +668,10 @@ pub struct TargetCounts {
     pub raced: u64,
     pub unindexed: u64,
     pub deferred: u64,
+    /// The block table's entries now and its growths so far
+    /// (`chain::LookupTable::grow`).
+    pub entries: u64,
+    pub growths: u64,
 }
 
 /// Board events counted outside the lock: rare, so a shared atomic each,
@@ -625,34 +755,59 @@ pub(super) fn slot_capacity(code_bytes: Option<usize>) -> u32 {
 }
 
 impl Cache {
-    fn new(targets: LookupTable, finder: Arc<Finder>) -> Self {
+    fn new(targets: LookupTable) -> Self {
         Self {
-            index: BlockIndex::with_finder(finder),
             targets,
-            code_slots: CodeSlots::default(),
-            page_blocks: Vec::new(),
-            marked: Vec::new(),
             dispatchers: Vec::new(),
             lock: LockCounts::default(),
             targets_inserted: 0,
             targets_raced: 0,
-            census: None,
-            churn: super::ChurnCounts::default(),
+            table_retired: None,
+        }
+    }
+}
+
+impl LockCounts {
+    /// The longest wait and holds start over, as a report does.
+    fn restart_longest(&mut self) {
+        self.longest = 0;
+        for site in &mut self.sites {
+            site.longest_held = 0;
+        }
+    }
+
+    /// Add `other`'s counts, another lock's: their longest is the larger.
+    pub fn add(&mut self, other: &Self) {
+        self.acquired += other.acquired;
+        self.contended += other.contended;
+        self.waited += other.waited;
+        self.longest = self.longest.max(other.longest);
+        for (site, more) in self.sites.iter_mut().zip(&other.sites) {
+            site.acquired += more.acquired;
+            site.waited += more.waited;
+            site.held += more.held;
+            site.longest_held = site.longest_held.max(more.longest_held);
         }
     }
 }
 
 impl Code {
-    /// Room for `slots` blocks and a block table of `entries`
-    /// (`chain::lookup_entries`).
+    /// Room for `slots` blocks and a block table of `entries` at first
+    /// (`chain::first_lookup_entries`), which doubles as blocks fill it
+    /// (`chain::LookupTable::grow`).
     pub(super) fn new(slots: u32, entries: usize, window: Option<CodeWindow>) -> Self {
         let targets = LookupTable::with_entries(entries);
         let finder = Arc::new(Finder::new(slots));
         Self {
             blocks: Blocks::new(slots),
             table: targets.reader(),
-            finder: Arc::clone(&finder),
-            cache: Mutex::new(Cache::new(targets, finder)),
+            shards: (0..SHARDS)
+                .map(|_| CodeLock::new(Shard::new(Arc::clone(&finder))))
+                .collect(),
+            code_slots: Mutex::new(CodeSlots::default()),
+            census: Mutex::new(None),
+            finder,
+            cache: CodeLock::new(Cache::new(targets)),
             ghosts: super::churn::Churn::new(slots),
             arena: window.map(Arena::new),
             epoch: Padded(AtomicU64::new(0)),
@@ -660,7 +815,6 @@ impl Code {
             retiring: Mutex::new(None),
             retire_pending: AtomicBool::new(false),
             step_visits: super::code_cache::STEP_VISITS,
-            waiting: Padded(AtomicU32::new(0)),
             tagged: Default::default(),
             two_sided: Default::default(),
             rebases: super::rebase::Rebases::new(super::rebase::BOUND),
@@ -674,54 +828,67 @@ impl Code {
         self.cache_at(LockSite::Other)
     }
 
-    /// The board's code lock, counted ([`LockCounts`]) for `site`.
+    /// The block table's lock, counted ([`LockCounts`]) for `site`.
     pub(super) fn cache_at(&self, site: LockSite) -> CacheGuard<'_> {
-        let site = site as usize;
-        if let Ok(mut cache) = self.cache.try_lock() {
-            cache.lock.acquired += 1;
-            cache.lock.sites[site].acquired += 1;
-            return CacheGuard {
-                guard: cache,
-                site,
-                since: timestamp(),
-            };
-        }
-        let start = timestamp();
-        self.waiting.fetch_add(1, Ordering::Relaxed);
-        let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
-        self.waiting.fetch_sub(1, Ordering::Relaxed);
-        let since = timestamp();
-        let waited = since.wrapping_sub(start);
-        let lock = &mut cache.lock;
-        lock.acquired += 1;
-        lock.contended += 1;
-        lock.waited += waited;
-        lock.longest = lock.longest.max(waited);
-        lock.sites[site].acquired += 1;
-        lock.sites[site].waited += waited;
-        CacheGuard {
-            guard: cache,
-            site,
-            since,
-        }
+        self.cache.at(site)
     }
 
-    /// Whether a PE waits for the code lock now: a holder doing work that
-    /// can stop at any of its bounds (a retirement step) lets it in first.
-    pub(super) fn wanted(&self) -> bool {
-        self.waiting.load(Ordering::Relaxed) != 0
+    /// The lock of the index shard of the page holding `physical`, counted
+    /// for `site`.
+    pub(super) fn page_at(&self, physical: u64, site: LockSite) -> PageGuard<'_> {
+        self.shard_lock(physical).at(site)
+    }
+
+    /// The index shard of the page holding `physical`.
+    pub(super) fn shard_lock(&self, physical: u64) -> &CodeLock<Shard> {
+        &self.shards[super::block_index::shard_of(physical)]
+    }
+
+    /// Every index shard, held in shard order: for a discard of every
+    /// block, and for reports and tests that read the whole index.
+    pub(super) fn every_page(&self, site: LockSite) -> EveryPage<'_> {
+        EveryPage(self.shards.iter().map(|shard| shard.at(site)).collect())
+    }
+
+    /// Every index shard held, for a test that reads the whole index.
+    #[cfg(test)]
+    pub(super) fn index(&self) -> EveryPage<'_> {
+        self.every_page(LockSite::Other)
+    }
+
+    /// The counts of every code lock, the block table's and the shards',
+    /// taken without counting these takes.
+    #[cfg(test)]
+    pub(super) fn lock_counts(&self) -> LockCounts {
+        let mut counts = self.cache.uncounted().lock;
+        for shard in self.shards.iter() {
+            counts.add(&shard.uncounted().lock);
+        }
+        counts
+    }
+
+    /// The installs again of blocks the board held before, every shard's.
+    #[cfg(test)]
+    pub(super) fn churn_counts(&self) -> super::ChurnCounts {
+        let mut churn = super::ChurnCounts::default();
+        for shard in self.shards.iter() {
+            churn.add(&shard.uncounted().churn);
+        }
+        churn
     }
 
     /// The indexed block at `pc`, `physical` and `variant`: from the
     /// [`Finder`] without the lock, which a caller inside its section may
-    /// read, or under it when the finder cannot say.
+    /// read, or under its shard's when the finder cannot say.
     pub(super) fn find(&self, pc: u64, physical: u64, variant: VariantId) -> Option<usize> {
         match self.finder.find(&self.blocks, pc, physical, variant) {
             Some(found) => found,
-            None => self
-                .cache_at(LockSite::Fetch)
-                .index
-                .get(&self.blocks, pc, physical, variant),
+            None => self.page_at(physical, LockSite::Fetch).index.get(
+                &self.blocks,
+                pc,
+                physical,
+                variant,
+            ),
         }
     }
 
@@ -732,17 +899,24 @@ impl Code {
 
     /// What the board's code came to; the lock's longest wait starts over.
     pub(super) fn report(&self) -> CodeReport {
-        let (lock, inserted, raced, churn) = {
+        let (mut lock, inserted, raced, table) = {
             let mut cache = self.cache_at(LockSite::Report);
             let lock = cache.lock;
             let counts = (cache.targets_inserted, cache.targets_raced);
-            let churn = cache.churn;
-            cache.lock.longest = 0;
-            for site in &mut cache.lock.sites {
-                site.longest_held = 0;
-            }
-            (lock, counts.0, counts.1, churn)
+            let table = (
+                cache.targets.entries() as u64,
+                u64::from(cache.targets.growths()),
+            );
+            cache.lock.restart_longest();
+            (lock, counts.0, counts.1, table)
         };
+        let mut churn = super::ChurnCounts::default();
+        for shard in self.shards.iter() {
+            let mut shard = shard.uncounted();
+            lock.add(&shard.lock);
+            churn.add(&shard.churn);
+            shard.lock.restart_longest();
+        }
         let count = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         CodeReport {
             window: self.arena.as_ref().map_or(0, |arena| arena.window.bytes),
@@ -768,6 +942,8 @@ impl Code {
                 raced,
                 unindexed: count(&self.events.targets_unindexed),
                 deferred: count(&self.events.targets_deferred),
+                entries: table.0,
+                growths: table.1,
             },
             lock,
             churn,
@@ -797,12 +973,96 @@ impl Code {
         if let Some(arena) = &mut self.arena {
             *arena = Arena::new(arena.window);
         }
+        for shard in self.shards.iter() {
+            shard.at(LockSite::Discard).index.clear();
+        }
+        *self
+            .code_slots
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = CodeSlots::default();
         let mut cache = self.cache_at(LockSite::Discard);
         cache.targets.release_cells(0..=u64::MAX);
         cache.targets.clear();
-        cache.index.clear();
-        cache.code_slots = CodeSlots::default();
         cache.dispatchers.clear();
+    }
+}
+
+/// Every index shard held, in shard order ([`Code::every_page`]): the
+/// whole block index, read as one.
+pub(super) struct EveryPage<'a>(Vec<PageGuard<'a>>);
+
+impl EveryPage<'_> {
+    /// The shard of the page holding `physical`.
+    #[cfg(test)]
+    pub(super) fn shard(&mut self, physical: u64) -> &mut Shard {
+        &mut self.0[super::block_index::shard_of(physical)]
+    }
+
+    /// Forget every page.
+    pub(super) fn clear(&mut self) {
+        for shard in &mut self.0 {
+            shard.index.clear();
+        }
+    }
+
+    /// The indexed blocks.
+    #[cfg(any(test, all(feature = "std", feature = "native-profile")))]
+    pub(super) fn len(&self) -> usize {
+        self.0.iter().map(|shard| shard.index.len()).sum()
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The physical pages that have indexed blocks, in no order.
+    pub(super) fn frames(&self) -> impl Iterator<Item = u64> + '_ {
+        self.0.iter().flat_map(|shard| shard.index.frames())
+    }
+
+    /// The heap bytes the index holds.
+    pub(super) fn heap_bytes(&self) -> usize {
+        self.0.iter().map(|shard| shard.index.heap_bytes()).sum()
+    }
+
+    /// The blocks of the page holding `physical`.
+    #[cfg(test)]
+    pub(super) fn page(&self, physical: u64) -> impl Iterator<Item = usize> + '_ {
+        self.0[super::block_index::shard_of(physical)]
+            .index
+            .page(physical)
+    }
+
+    /// The block at `pc`, `physical` and `variant`.
+    #[cfg(test)]
+    pub(super) fn get(
+        &mut self,
+        blocks: &Blocks,
+        pc: u64,
+        physical: u64,
+        variant: VariantId,
+    ) -> Option<usize> {
+        self.shard(physical)
+            .index
+            .get(blocks, pc, physical, variant)
+    }
+
+    /// The indexed blocks past `cursor`, in page order as one index would
+    /// give them, at most `most`, each with the cursor that goes on after it.
+    pub(super) fn sweep(
+        &self,
+        cursor: Option<super::block_index::Cursor>,
+        most: usize,
+    ) -> Vec<(super::block_index::Cursor, usize)> {
+        let mut swept: Vec<_> = self
+            .0
+            .iter()
+            .flat_map(|shard| shard.index.sweep(cursor).take(most))
+            .collect();
+        swept.sort_unstable_by_key(|&(cursor, _)| cursor);
+        swept.truncate(most);
+        swept
     }
 }
 
@@ -831,11 +1091,20 @@ pub(super) struct Record {
     used: AtomicU64,
     /// Its dynamic exit is served by a lookup dispatcher.
     dynamic: AtomicBool,
+    /// The patch point of the miss of its dynamic exit's predicted tail
+    /// while that miss still returns to the engine
+    /// (`chain::open_predicted_tail`), and the target the tail predicts:
+    /// the miss's next target becomes the site's second.
+    second: AtomicU64,
+    second_target: AtomicU64,
     /// Its install lost to another PE's of the same block: never reachable.
     lost: AtomicBool,
     /// Jump cache hits that found no block table entry of it and went for
     /// the lock to add one ([`Self::remember`]).
     remembers: AtomicU32,
+    /// Engine fetches that found it since its install, up to two, while
+    /// step timing counts them ([`Self::fetched`]).
+    fetches: AtomicU8,
     /// Its fault recovery rows, under a lock of their own: a PE faulting
     /// in the block reads them, its first fault may qualify them. They stay
     /// after the block retires until the slot takes its next block, as a
@@ -854,8 +1123,11 @@ impl Default for Record {
             settled: AtomicU64::new(0),
             used: AtomicU64::new(0),
             dynamic: AtomicBool::new(false),
+            second: AtomicU64::new(0),
+            second_target: AtomicU64::new(0),
             lost: AtomicBool::new(false),
             remembers: AtomicU32::new(0),
+            fetches: AtomicU8::new(0),
             recovery: Mutex::new(None),
         }
     }
@@ -953,6 +1225,20 @@ impl Record {
         self.live.load(Ordering::Acquire)
     }
 
+    /// Count an engine fetch that found its block, up to two. A plain load
+    /// and store: PEs fetching it at once may count one fetch for two.
+    pub(super) fn fetched(&self) {
+        let fetches = self.fetches.load(Ordering::Relaxed);
+        if fetches < 2 {
+            self.fetches.store(fetches + 1, Ordering::Relaxed);
+        }
+    }
+
+    /// The engine fetches that found its block since its install, up to two.
+    pub(super) fn fetches(&self) -> usize {
+        usize::from(self.fetches.load(Ordering::Relaxed))
+    }
+
     /// Whether successor `position` is linked or settled: not to link.
     pub(super) fn linked(&self, position: usize) -> bool {
         (self.linked.load(Ordering::Acquire) | self.settled.load(Ordering::Acquire)) & 1 << position
@@ -997,6 +1283,28 @@ impl Record {
 
     pub(super) fn close_dynamic(&self) {
         self.dynamic.store(true, Ordering::Release);
+    }
+
+    /// The patch point of its predicted tail's open miss and the target the
+    /// tail predicts, while the miss returns to the engine.
+    pub(super) fn second(&self) -> Option<(u64, u64)> {
+        let miss = self.second.load(Ordering::Acquire);
+        (miss != 0).then(|| (miss, self.second_target.load(Ordering::Relaxed)))
+    }
+
+    /// Its predicted tail of `target` misses through the dynamic exit whose
+    /// patch point is `miss`: under the board's lock.
+    pub(super) fn open_second(&self, miss: u64, target: u64) {
+        self.second_target.store(target, Ordering::Relaxed);
+        self.second.store(miss, Ordering::Release);
+    }
+
+    /// [`Self::second`], which no other caller then takes: under the
+    /// board's lock.
+    pub(super) fn take_second(&self) -> Option<(u64, u64)> {
+        let held = self.second()?;
+        self.second.store(0, Ordering::Release);
+        Some(held)
     }
 
     /// Whether its install lost to another PE's ([`Self::mark_lost`]).
@@ -1152,8 +1460,10 @@ impl Blocks {
         record.settled.store(0, Ordering::Relaxed);
         record.used.store(0, Ordering::Relaxed);
         record.dynamic.store(false, Ordering::Relaxed);
+        record.second.store(0, Ordering::Relaxed);
         record.lost.store(false, Ordering::Relaxed);
         record.remembers.store(0, Ordering::Relaxed);
+        record.fetches.store(0, Ordering::Relaxed);
         record.incarnation.fetch_add(1, Ordering::Release);
         record.live.store(true, Ordering::Release);
         self.live.fetch_add(1, Ordering::Relaxed);

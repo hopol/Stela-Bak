@@ -145,6 +145,9 @@ pub(super) struct Mirrors {
     /// entered, which the engine takes when it returns
     /// ([`Machine::take_event_spins`]).
     pub(super) spin: register_read::EventSpin,
+    /// The event stream native WFEs sample, as the engine published it
+    /// ([`Machine::enter_events`]) and they moved it.
+    pub(super) stream: register_read::EventStream,
     /// The board's fast-IPI table as this PE's native IPI writes use it,
     /// all 0 until the engine installs one ([`Machine::enter_fast_ipi`]),
     /// and the PEs they found halted, which the engine wakes when native
@@ -153,6 +156,10 @@ pub(super) struct Mirrors {
     /// The plain device reads native device sites complete again
     /// ([`DEVICE_READ_KEY`]), a slot per site.
     pub(super) device_reads: [register_read::DeviceRead; register_read::DEVICE_READS],
+    /// The TTBR0 values a native MSR TTBR0 switches to
+    /// (`x86_64::table_switch`), and the switches it made since the engine
+    /// last settled them ([`Machine::settle_native_switches`]).
+    pub(super) table_switch: table_switch::Table,
 }
 
 /// Where native code finds the cell at `index` of the PE's state.
@@ -320,6 +327,7 @@ pub(super) const EVENT_WAIT: register_read::EventWaitPlaces = register_read::Eve
     lines_until: Place::new(Anchor::Mirrors, offset_of!(Mirrors, lines_until)),
     count: Place::new(Anchor::Count, 0),
     spin: Place::new(Anchor::Mirrors, offset_of!(Mirrors, spin)),
+    stream: Place::new(Anchor::Mirrors, offset_of!(Mirrors, stream)),
 };
 
 /// The cell open where MSR IPI_RR_LOCAL, IPI_RR_GLOBAL and IPI_SR
@@ -466,8 +474,10 @@ impl Default for Mirrors {
             cycles: register_read::CycleCounter::default(),
             instructions: register_read::InstructionCounter::default(),
             spin: register_read::EventSpin::default(),
+            stream: register_read::EventStream::default(),
             fast_ipi: register_read::FastIpi::default(),
             device_reads: [register_read::DeviceRead::default(); register_read::DEVICE_READS],
+            table_switch: table_switch::Table::default(),
         }
     }
 }
@@ -494,8 +504,40 @@ pub(super) const TRANSITIONS: transition::Places = transition::Places {
     ),
     cycles: CYCLES,
     instructions: INSTRUCTION_COUNTER,
+    cr3: stela_compiler::x86_64::table_switch::Cr3::Register,
 };
 const _: () = assert!(size_of::<usize>() == size_of::<u64>());
+
+/// The places a native TTBR0 switch writes besides the host's
+/// (`x86_64::table_switch::Places`): its table, the chain's lookup
+/// contexts and salts, the transition records' contexts generation, and the
+/// code-page and device-read cells of every state, which a TTBR0 change
+/// closes ([`Machine::advance_table_generation`]).
+pub(super) fn table_switch_places(
+    cr3: Option<table_switch::Cr3>,
+    isolate: bool,
+) -> table_switch::Places {
+    let cell = |state: usize, index: usize| {
+        Place::new(
+            Anchor::Mirrors,
+            offset_of!(Mirrors, banks) + (state * CELLS + index) * size_of::<register_read::Cell>(),
+        )
+    };
+    table_switch::Places {
+        table: Place::new(Anchor::Mirrors, offset_of!(Mirrors, table_switch)),
+        contexts: Place::new(Anchor::Control, offset_of!(chain::ChainControl, contexts)),
+        salts: Place::new(Anchor::Control, offset_of!(chain::ChainControl, salts)),
+        contexts_generation: Place::new(
+            Anchor::Mirrors,
+            offset_of!(Mirrors, transitions) + offset_of!(transition::Table, contexts_generation),
+        ),
+        closes: (0..MIRROR_STATES)
+            .flat_map(|state| [cell(state, CODE_PAGE), cell(state, DEVICE_READ_KEY)])
+            .collect(),
+        cr3,
+        isolate,
+    }
+}
 
 /// The PSTATE fields with registers of their own that a kernel saves and
 /// restores around each exception, which only the engine reads besides
@@ -576,6 +618,17 @@ impl Mirrors {
             }
         }
         self.entered = 1 << self.state;
+    }
+
+    /// The open cells [`Self::close_all`] would close.
+    pub(super) fn open_cells(&self) -> u64 {
+        self.banks
+            .iter()
+            .enumerate()
+            .filter(|&(state, _)| self.entered >> state & 1 != 0)
+            .flat_map(|(_, cells)| cells)
+            .filter(|cell| cell.readable != 0)
+            .count() as u64
     }
 
     /// Whether every cell is closed.

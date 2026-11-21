@@ -407,6 +407,11 @@ unsafe impl Drm for &mut Card {
                     sequence.sequence = 7;
                     sequence.sequence_ns = ns;
                 }
+                PRIME_HANDLE_TO_FD => {
+                    let prime = &mut *argument.cast::<PrimeHandle>();
+                    assert_eq!(prime.flags, PRIME_FLAGS);
+                    prime.fd = 1000 + prime.handle as i32;
+                }
                 REMOVE_FB => self.removed.push(*argument.cast::<u32>()),
                 DESTROY_DUMB => self
                     .destroyed

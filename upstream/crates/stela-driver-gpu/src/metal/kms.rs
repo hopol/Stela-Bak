@@ -83,6 +83,9 @@ const OBJECT_PROPERTIES: u32 = request::<ObjectProperties>(0xb9);
 const SET_OBJECT_PROPERTY: u32 = request::<SetProperty>(0xba);
 const GET_BLOB: u32 = request::<Blob>(0xac);
 const VERSION: u32 = request::<Version>(0x00);
+const PRIME_HANDLE_TO_FD: u32 = request::<PrimeHandle>(0x2d);
+/// `DRM_CLOEXEC | DRM_RDWR`: a dma-buf the GPU may write.
+const PRIME_FLAGS: u32 = 0o2_000_000 | 2;
 
 /// `DRM_MODE_CONNECTED`.
 const CONNECTED: u32 = 1;
@@ -314,6 +317,25 @@ struct SetProperty {
     id: u32,
     object: u32,
     kind: u32,
+}
+
+/// `struct drm_prime_handle`.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct PrimeHandle {
+    handle: u32,
+    flags: u32,
+    fd: i32,
+}
+
+/// A scanout buffer shared as a dma-buf, which the GPU composes frames
+/// into: named by its framebuffer, with its bytes between rows and size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedBuffer {
+    pub framebuffer: u32,
+    pub fd: i32,
+    pub pitch: usize,
+    pub bytes: usize,
 }
 
 /// What stops the display.
@@ -2261,6 +2283,62 @@ impl<D: Drm> Display<D> {
         filled?;
         self.stale[2] = 0..0;
         Ok(PreparedFrame(self))
+    }
+
+    /// The three scanout buffers as dma-bufs, for the GPU to compose into,
+    /// where a request completes now; `None` elsewhere. The caller owns the
+    /// descriptors.
+    pub fn share_buffers(&mut self) -> Option<Result<[SharedBuffer; 3], Error>> {
+        if !self.drm.immediate() {
+            return None;
+        }
+        let mut shared = [SharedBuffer {
+            framebuffer: 0,
+            fd: -1,
+            pitch: 0,
+            bytes: 0,
+        }; 3];
+        for (out, buffer) in shared.iter_mut().zip(&self.buffers) {
+            let mut prime = PrimeHandle {
+                handle: buffer.handle,
+                flags: PRIME_FLAGS,
+                fd: -1,
+            };
+            if let Err(error) = call(&mut self.drm, PRIME_HANDLE_TO_FD, &mut prime) {
+                return Some(Err(error));
+            }
+            *out = SharedBuffer {
+                framebuffer: buffer.framebuffer,
+                fd: prime.fd,
+                pitch: buffer.pitch,
+                bytes: buffer.bytes,
+            };
+        }
+        Some(Ok(shared))
+    }
+
+    /// The buffer the next frame fills, by its framebuffer, and the rows of
+    /// it the GPU must compose: `damage` (`None`: every row) and the rows it
+    /// lacks of the newest frame. Until [`Self::present_drawn`] the CPU
+    /// fills no rows, and a frame the buffer held waits for no flip: the
+    /// GPU draws the newer frame over it, the rows it showed included.
+    pub fn draw_rows(&mut self, damage: Option<Range<usize>>) -> (u32, Range<usize>) {
+        self.queued = false;
+        let height = self.height as usize;
+        let damage = damage.map_or(0..height, |rows| {
+            rows.start.min(height)..rows.end.min(height)
+        });
+        for stale in &mut self.stale {
+            *stale = union(stale.clone(), damage.clone());
+        }
+        (self.buffers[2].framebuffer, self.stale[2].clone())
+    }
+
+    /// The GPU composed the rows [`Self::draw_rows`] named: queue the
+    /// hidden buffer's flip for the next vertical blank.
+    pub fn present_drawn(&mut self) -> Result<(), Error> {
+        self.stale[2] = 0..0;
+        self.queue()
     }
 
     /// Whether a frame waits in the hidden buffer for its flip to be

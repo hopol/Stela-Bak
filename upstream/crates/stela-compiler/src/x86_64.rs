@@ -156,6 +156,7 @@ mod scalable_matrix;
 pub(crate) mod shared_memory;
 mod simd;
 mod stack_alignment;
+pub mod table_switch;
 pub mod transition;
 pub(crate) use simd::CheckedMemoryOperand as CheckedFixedMemoryOperand;
 pub mod cache_clean;
@@ -212,6 +213,11 @@ pub struct NativeSystem {
     /// profiles.
     #[serde(default)]
     pub loop_counts: bool,
+    /// A block runs on past the branches it would end at, to a terminal
+    /// that is not a branch, when it then holds a loop: its branches into
+    /// itself jump there (`block::region`).
+    #[serde(default)]
+    pub regions: bool,
 }
 
 impl NativeSystem {
@@ -225,6 +231,7 @@ impl NativeSystem {
         amx: false,
         self_loops: false,
         loop_counts: false,
+        regions: false,
     };
 }
 

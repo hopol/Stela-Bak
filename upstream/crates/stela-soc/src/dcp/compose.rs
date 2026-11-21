@@ -18,7 +18,7 @@
 //! instead, where a DART fault has its effects as before. Calls that drop
 //! queued swaps (an abort, a link shutdown, a sleep) first wait for a
 //! compose in flight to end, so they act on the swaps as they were after it.
-use super::super::scanout::{self, Composed, Layer, PixelFormat, Scanout};
+use super::super::scanout::{self, Composed, GpuPresent, Layer, PixelFormat, Scanout};
 use crate::Result;
 use crate::handoff::Handoff;
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
@@ -107,7 +107,7 @@ pub(crate) struct Missed;
 /// The I/O address ranges `layer`'s source rows occupy in each of its
 /// surface's planes: from its first row's first pixel to its last row's
 /// last; `None` on overflow.
-fn layer_spans(layer: &Layer) -> Option<Vec<Range<u64>>> {
+pub(crate) fn layer_spans(layer: &Layer) -> Option<Vec<Range<u64>>> {
     let source = layer.source;
     if source.width == 0 || source.height == 0 {
         return Some(Vec::new());
@@ -143,6 +143,8 @@ pub(crate) struct Composition {
     pub composed: Composed,
     pub result: Result<()>,
     pub missed: bool,
+    /// Why the sink left the frame to the CPU, when it did.
+    pub declined: Option<&'static str>,
 }
 
 /// A present's compose, run outside the devices' lock ([`Self::run`]).
@@ -195,12 +197,26 @@ impl Compose {
                 false
             }
         };
-        let result = scanout::present(sink.as_mut(), &layers, damage, read, &mut composed);
+        // The GPU composes the frame where the sink can; the CPU otherwise.
+        let physical = |iova: u64| pages.physical(iova);
+        let offered = sink.try_present_gpu(&layers, damage.clone(), &physical);
+        let (result, declined) = match offered {
+            Ok(GpuPresent::Taken) => {
+                composed.forget();
+                (Ok(()), None)
+            }
+            Ok(GpuPresent::Declined(reason)) => (
+                scanout::present(sink.as_mut(), &layers, damage, read, &mut composed),
+                Some(reason),
+            ),
+            Err(error) => (Err(error), None),
+        };
         done.put(Composition {
             sink,
             composed,
             result,
             missed,
+            declined,
         });
     }
 }
